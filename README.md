@@ -34,11 +34,21 @@ In the desktop app, where `/plugin` does not run: click + next to the prompt box
 
 The pane opens by itself on a terminal 144 columns wide or more. `/deck` opens it at any width and refreshes the routine list.
 
+## Settings
+
+Both show up as rows in `/config`, and a change there applies at once.
+
+| Setting | Default | What it does |
+| --- | --- | --- |
+| Handoff mark (`handoffAt`) | `50` | The context percent the deck marks for a handoff. A toast fires when context reaches it, and a warning 10 points earlier. |
+| Status line (`statusLine`) | `full` | What the deck pins under the prompt: `full` for context and limits, `limits` if your own status line already shows context, or `off`. |
+
+`/config` keeps them in your `settings.json` under `pluginConfigs`.
+
 ## Notes
 
 - The routine list comes from the `RemoteTrigger` tool, so it needs a claude.ai sign-in. The mod allows its own read-only `list` call so the 30-minute refresh never raises a permission prompt. Every other `RemoteTrigger` call goes through your normal permissions.
 - Limits show only on a Claude subscription, after the first reply of a session.
-- The 50% handoff mark is fixed in `hooks/register.tsx` as `HANDOFF_AT`.
 - Mods are built on Claude Code's function hooks, an early-access API, so a later release may need changes here.
 
 ## Develop

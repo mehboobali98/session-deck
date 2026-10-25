@@ -1,6 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type {
   EngineInterface,
+  PluginOptions,
   Register,
   SessionContextUsage,
   SessionRateLimit,
@@ -13,8 +14,6 @@ const TITLE = 'Session'
 const TOOL = 'mcp__session-deck__plan_progress'
 const PLAN_FILE = /\/docs\/superpowers\/plans\/[^/]+\.md$/
 const TASK_HEADING = /^#{2,4}[ \t]+Task[ \t]+(\d+)[ \t]*[:.)–-]?[ \t]*(.*)$/gm
-const WARN_AT = 40
-const HANDOFF_AT = 50
 const LIMIT_WARN_AT = 80
 const LIMIT_ALARM_AT = 95
 const ROUTINE_REFRESH_MS = 30 * 60_000
@@ -47,15 +46,32 @@ const isStatus = (value: unknown): value is TaskStatus =>
 
 const storeKey = (path: string) => `plan:${path}`
 
+type StatusMode = 'full' | 'limits' | 'off'
+
+type Settings = { handoffAt: number; warnAt: number; statusLine: StatusMode }
+
+/**
+ * @return [Settings] the manifest's userConfig values, with the early warning 10 points
+ *   before the handoff mark
+ */
+function settingsFrom(options: PluginOptions): Settings {
+  const handoffAt = Math.min(95, Math.max(10, Math.round(Number(options.handoffAt) || 50)))
+  const statusLine = options.statusLine === 'limits' || options.statusLine === 'off' ? options.statusLine : 'full'
+
+  return { handoffAt, warnAt: handoffAt - 10, statusLine }
+}
+
 const toUsage = (context: SessionContextUsage, limits: readonly SessionRateLimit[]): Usage => ({
   percent: context.percent,
   window: context.window,
   limits: limits.map(({ kind, percentUsed, resetsAt }) => ({ kind, percentUsed, resetsAt })),
 })
 
-function statusText(u: Usage): string | undefined {
+function statusText(u: Usage, mode: StatusMode): string | undefined {
+  if (mode === 'off') return undefined
+
   const parts = [
-    ...(u.percent === undefined ? [] : [`ctx ${u.percent}%`]),
+    ...(mode === 'full' && u.percent !== undefined ? [`ctx ${u.percent}%`] : []),
     ...u.limits.map(l => `${label(l.kind)} ${Math.round(l.percentUsed)}%`),
   ]
 
@@ -69,14 +85,14 @@ function crossed(before: number | undefined, after: number | undefined, marks: n
   return marks.filter(mark => (before ?? 0) < mark && (after ?? 0) >= mark).pop()
 }
 
-function alerts(before: Usage | null, after: Usage, at: number): string[] {
+function alerts(before: Usage | null, after: Usage, at: number, { warnAt, handoffAt }: Settings): string[] {
   const lines: string[] = []
-  const mark = crossed(before?.percent, after.percent, [WARN_AT, HANDOFF_AT])
+  const mark = crossed(before?.percent, after.percent, [warnAt, handoffAt])
 
-  if (mark === HANDOFF_AT) {
+  if (mark === handoffAt) {
     lines.push(`Context at ${after.percent}%: write the handoff before starting anything new`)
   } else if (mark !== undefined) {
-    lines.push(`Context at ${after.percent}%: aim for a clean stopping point by ${HANDOFF_AT}%`)
+    lines.push(`Context at ${after.percent}%: aim for a clean stopping point by ${handoffAt}%`)
   }
 
   for (const limit of after.limits) {
@@ -206,7 +222,9 @@ async function tick($: EngineInterface): Promise<void> {
   await update($, clock, () => at)
 }
 
-export const register: Register = on => {
+export const register: Register = (on, options) => {
+  const settings = settingsFrom(options)
+
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'deck',
@@ -229,7 +247,7 @@ export const register: Register = on => {
     const { context, rateLimits } = await $.session.usage()
     const seeded = toUsage(context, rateLimits)
     await update($, usage, () => seeded)
-    $.ui.status(statusText(seeded))
+    $.ui.status(statusText(seeded, settings.statusLine))
     await tick($)
 
     if (e.isInteractive) {
@@ -255,8 +273,8 @@ export const register: Register = on => {
     const at = await $.clock.now()
 
     await update($, usage, () => after)
-    $.ui.status(statusText(after))
-    for (const line of alerts(before, after, at)) $.ui.toast(line, { timeoutMs: 8000 })
+    $.ui.status(statusText(after, settings.statusLine))
+    for (const line of alerts(before, after, at, settings)) $.ui.toast(line, { timeoutMs: 8000 })
 
     return next(e)
   })
@@ -360,8 +378,8 @@ export const register: Register = on => {
           <Text dimColor>No reading yet</Text>
         ) : (
           <Text>
-            <Text color={tone(u.percent, WARN_AT, HANDOFF_AT)}>{bar(u.percent, barWidth)}</Text>{' '}
-            {u.percent}%<Text dimColor>  handoff at {HANDOFF_AT}%</Text>
+            <Text color={tone(u.percent, settings.warnAt, settings.handoffAt)}>{bar(u.percent, barWidth)}</Text>{' '}
+            {u.percent}%<Text dimColor>  handoff at {settings.handoffAt}%</Text>
           </Text>
         )}
 

@@ -1,6 +1,23 @@
 {
   "name": "session-deck",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "A pane beside the chat with context fill, plan usage limits, implementation plan progress and scheduled tasks",
-  "types": "./types/index.d.ts"
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "handoffAt": {
+      "type": "number",
+      "title": "Handoff mark",
+      "description": "Context percent the deck marks for a handoff, with a toast when it is reached and a warning 10 points earlier",
+      "default": 50,
+      "min": 10,
+      "max": 95
+    },
+    "statusLine": {
+      "type": "string",
+      "title": "Status line",
+      "description": "What the deck pins under the prompt: full (context and limits), limits (for a status line that already shows context) or off",
+      "default": "full",
+      "options": ["full", "limits", "off"]
+    }
+  }
 }
