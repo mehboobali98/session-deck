@@ -8,7 +8,7 @@ import type {
   TurnStepInput,
 } from 'claude-code'
 
-import type { Agent, Effort, FollowUp, Limit, Part, Plan, Routine, TaskStatus, Usage } from '../types'
+import type { Agent, Checks, Effort, FollowUp, Limit, Part, Plan, PullRequest, Repo, Routine, TaskStatus, Usage } from '../types'
 
 const PANE = 'session-deck'
 const TITLE = 'Session'
@@ -29,6 +29,8 @@ const MONTHS = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', '
 const FOLLOW_UP_ROWS = 6
 const FILL_PARTS = 3
 const RESULT_MIN_TOKENS = 1_000
+const PR_REFRESH_MS = 2 * 60_000
+const FAILED_CHECKS = ['FAILURE', 'ERROR', 'TIMED_OUT', 'CANCELLED', 'ACTION_REQUIRED', 'STARTUP_FAILURE']
 const ACCENT = 'suggestion'
 const TRACK = 'subtle'
 
@@ -57,6 +59,7 @@ const checklist = atom(
   { shape: 'checklist-1' },
 )
 const followUps = atom({ plugin: 'session-deck', key: 'followUps' } as const, null, { shape: 'follow-ups-1' })
+const repo = atom({ plugin: 'session-deck', key: 'repo' } as const, null, { shape: 'repo-1' })
 const fill = atom({ plugin: 'session-deck', key: 'fill' } as const, { parts: [], results: [] }, { shape: 'fill-1' })
 const clock = atom({ plugin: 'session-deck', key: 'now' } as const, 0)
 
@@ -434,6 +437,74 @@ function resultName(tool: string, input: Record<string, unknown>): string {
 
 const listed = (parts: readonly Part[]) => parts.map(p => `${p.name} ${tokens(p.tokens)}`).join(', ')
 
+/**
+ * @return [Repo, undefined] the branch, changed files and distance from upstream in
+ *   `git status --porcelain --branch` output, or undefined when it has no branch line
+ */
+function repoFrom(status: string): Omit<Repo, 'pr' | 'prCheckedAt'> | undefined {
+  const [head, ...files] = status.split('\n')
+  const match = /^## (?:No commits yet on )?(.+?)(?:\.\.\.\S+)?(?: \[(.*)\])?$/.exec(head ?? '')
+  const branch = match?.[1]
+  if (branch === undefined) return undefined
+
+  const ahead = Number(/ahead (\d+)/.exec(match?.[2] ?? '')?.[1] ?? 0)
+  const behind = Number(/behind (\d+)/.exec(match?.[2] ?? '')?.[1] ?? 0)
+
+  return { branch, changed: files.filter(f => f.trim() !== '').length, ahead, behind }
+}
+
+/**
+ * @return [String] how a PR's checks stand: any failed is failing, any unfinished is running
+ */
+function checksOf(rollup: unknown): Checks {
+  const runs = Array.isArray(rollup) ? (rollup as { status?: string; conclusion?: string | null; state?: string }[]) : []
+  if (runs.length === 0) return 'none'
+
+  const outcomes = runs.map(run => (run.conclusion ?? run.state ?? '').toUpperCase())
+  if (outcomes.some(o => FAILED_CHECKS.includes(o))) return 'failing'
+  if (runs.some(run => run.status !== undefined && run.status !== 'COMPLETED') || outcomes.some(o => o === '' || o === 'PENDING')) {
+    return 'running'
+  }
+
+  return 'passing'
+}
+
+function prFrom(json: string): PullRequest | undefined {
+  try {
+    const view = JSON.parse(json) as { number?: unknown; state?: unknown; statusCheckRollup?: unknown }
+    if (typeof view.number !== 'number') return undefined
+
+    return { number: view.number, state: String(view.state ?? '').toLowerCase(), checks: checksOf(view.statusCheckRollup) }
+  } catch {
+    return undefined
+  }
+}
+
+async function refreshRepo($: EngineInterface): Promise<void> {
+  const status = await $.process.run(['git', '--no-optional-locks', 'status', '--porcelain=v1', '--branch'], { timeoutMs: 5_000 })
+  const found = status.exitCode === 0 ? repoFrom(status.stdout) : undefined
+  if (found === undefined) {
+    await update($, repo, () => null)
+    return
+  }
+
+  const at = await $.clock.now()
+  const last = await read($, repo)
+  if (last !== null && last.branch === found.branch && at - (last.prCheckedAt ?? -Infinity) < PR_REFRESH_MS) {
+    await update($, repo, () => ({ ...last, ...found }))
+    return
+  }
+
+  const view = await $.process
+    .run(['gh', 'pr', 'view', '--json', 'number,state,statusCheckRollup'], { timeoutMs: 15_000 })
+    .catch(() => undefined)
+  const pr = view?.exitCode === 0 ? prFrom(view.stdout) : undefined
+
+  await update($, repo, () => ({ ...found, prCheckedAt: at, ...(pr === undefined ? {} : { pr }) }))
+}
+
+const laterRefreshRepo = ($: EngineInterface) => $.clock.after(0, () => void refreshRepo($).catch(() => undefined))
+
 async function noteStep($: EngineInterface, e: TurnStepInput): Promise<void> {
   const ran = e.effort === undefined ? { model: e.model } : { model: e.model, effort: e.effort }
   const id = e.agentId
@@ -603,6 +674,7 @@ export const register: Register = (on, options) => {
       $.clock.every(60_000, () => void tick($))
       $.clock.every(ROUTINE_REFRESH_MS, () => void refreshRoutines($))
       $.clock.after(0, () => void refreshRoutines($))
+      laterRefreshRepo($)
       void $.ui.open({ id: PANE, title: TITLE })
     }
 
@@ -613,6 +685,7 @@ export const register: Register = (on, options) => {
     if (e.source === 'clear') {
       await seed($, settings)
       $.clock.after(0, () => void refreshRoutines($))
+      laterRefreshRepo($)
     }
 
     return next(e)
@@ -720,6 +793,7 @@ export const register: Register = (on, options) => {
 
   on('classic.Stop', async ($, e, next) => {
     await refreshFollowUps($, settings.followUps).catch(() => undefined)
+    laterRefreshRepo($)
     await update($, wakeups, () => ({
       crons: (e.session_crons ?? []).map(c => ({
         id: c.id,
@@ -788,7 +862,7 @@ export const register: Register = (on, options) => {
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const { Box, Text } = $.ui.resolve(e)
-    const [u, r, w, p, m, a, held, f, fl, ticked] = await Promise.all([
+    const [u, r, w, p, m, a, held, f, fl, g, ticked] = await Promise.all([
       read($, usage),
       read($, routines),
       read($, wakeups),
@@ -798,6 +872,7 @@ export const register: Register = (on, options) => {
       read($, checklist),
       read($, followUps),
       read($, fill),
+      read($, repo),
       read($, clock),
     ])
     const at = ticked || (await $.clock.now())
@@ -820,6 +895,12 @@ export const register: Register = (on, options) => {
     const resetWidth = Math.max(0, ...resets.map(reset => reset.length))
     const checked = r === null ? 0 : Math.max(0, at - r.fetchedAt)
     const scheduled = w.crons.length + w.jobs.length
+    const changes = g === null ? [] : [
+      g.changed > 0 ? `${g.changed} changed` : '',
+      g.ahead > 0 ? `${g.ahead} ahead` : '',
+      g.behind > 0 ? `${g.behind} behind` : '',
+    ].filter(Boolean)
+    const checksTone = { passing: 'success', failing: 'error', running: 'warning', none: undefined }
     const checksDone = settings.checks.filter(c => held.ticked.includes(c.label)).length
     const isChecked = checksDone === settings.checks.length
     const owed = (f?.items ?? [])
@@ -900,6 +981,14 @@ export const register: Register = (on, options) => {
             </Box>
           )
         })}
+
+        {g !== null && section('Repo', g.branch)}
+        {g !== null && <Text dimColor>{changes.length === 0 ? 'clean' : changes.join(', ')}</Text>}
+        {g?.pr !== undefined && (
+          <Text color={checksTone[g.pr.checks]} dimColor={g.pr.checks === 'none'}>
+            {fit(`PR #${g.pr.number} ${g.pr.state}, ${g.pr.checks === 'none' ? 'no checks' : `checks ${g.pr.checks}`}`, cols)}
+          </Text>
+        )}
 
         {section('Plan', p === null ? 'none' : `${done} of ${p.tasks.length} done`)}
         {p === null ? (

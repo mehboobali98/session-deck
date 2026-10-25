@@ -608,3 +608,65 @@ test('a compaction clears the largest results', async ($, on) => {
   expect(await ui.find({ type: 'Text', text: /largest results/ })).toBeUndefined()
   await ui.unmount()
 })
+
+const ran = (stdout: string, exitCode = 0) => ({
+  value: { exitCode, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false },
+})
+
+const CHECKS = JSON.stringify({
+  number: 8,
+  state: 'OPEN',
+  statusCheckRollup: [
+    { status: 'COMPLETED', conclusion: 'SUCCESS' },
+    { status: 'COMPLETED', conclusion: 'FAILURE' },
+  ],
+})
+
+test("the repo section shows the branch, what changed and the PR's checks", async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  on('classic.Stop', () => ({}))
+  on('process.run', (_, e) =>
+    e.argv[0] === 'git' ? ran('## repo-line...origin/repo-line [ahead 1]\n M hooks/register.tsx\n?? notes.md\n') : ran(CHECKS),
+  )
+
+  await $.classic.Stop({ stop_hook_active: false })
+  await clock.settle()
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: 'repo-line' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: '2 changed, 1 ahead' })).toBeDefined()
+  const pr = await ui.find({ type: 'Text', text: 'PR #8 open, checks failing' })
+  expect(pr?.props.color).toBe('error')
+  await ui.unmount()
+})
+
+test('the PR is asked for at most every two minutes', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  on('classic.Stop', () => ({}))
+  const asked: string[] = []
+  on('process.run', (_, e) => {
+    asked.push(e.argv[0] ?? '')
+    return e.argv[0] === 'git' ? ran('## main...origin/main\n') : ran(CHECKS)
+  })
+
+  await $.classic.Stop({ stop_hook_active: false })
+  await clock.settle()
+  await clock.advance(60_000)
+  await $.classic.Stop({ stop_hook_active: false })
+  await clock.settle()
+
+  expect(asked).toEqual(['git', 'gh', 'git'])
+})
+
+test('outside a git repository there is no repo section', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  on('classic.Stop', () => ({}))
+  on('process.run', () => ran('', 128))
+
+  await $.classic.Stop({ stop_hook_active: false })
+  await clock.settle()
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /^Repo/ })).toBeUndefined()
+  await ui.unmount()
+})
