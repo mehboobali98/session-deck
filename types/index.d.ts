@@ -52,6 +52,19 @@ export type Part = { name: string; tokens: number }
 
 export type Fill = { parts: Part[]; results: Part[] }
 
+export type Checks = 'passing' | 'failing' | 'running' | 'none'
+
+export type PullRequest = { number: number; state: string; checks: Checks }
+
+export type Repo = {
+  branch: string
+  changed: number
+  ahead: number
+  behind: number
+  pr?: PullRequest
+  prCheckedAt?: number
+}
+
 declare module 'claude-code' {
   interface PluginState {
     'session-deck': {
@@ -65,6 +78,7 @@ declare module 'claude-code' {
       checklist: Shaped<Checklist>
       followUps: Shaped<FollowUps | null>
       fill: Shaped<Fill>
+      repo: Shaped<Repo | null>
       now: number
     }
   }
