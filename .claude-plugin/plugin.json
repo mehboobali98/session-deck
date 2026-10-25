@@ -1,6 +1,6 @@
 {
   "name": "session-deck",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "A pane beside the chat with the model in use, context fill, plan usage limits and their forecast, plan progress, subagents and scheduled tasks",
   "types": "./types/index.d.ts",
   "userConfig": {
@@ -18,6 +18,12 @@
       "description": "What the deck pins under the prompt: full (context and limits), limits (for a status line that already shows context) or off",
       "default": "full",
       "options": ["full", "limits", "off"]
+    },
+    "checklist": {
+      "type": "string",
+      "title": "Session checklist",
+      "description": "Things to do at the start of every session, as Label=Tool or Label=Tool:path part, split by semicolons. The pane ticks each when its tool runs, and the first prompt of a session tells Claude what is still open",
+      "default": ""
     }
   }
 }

@@ -46,6 +46,11 @@ const plan = atom({ plugin: 'session-deck', key: 'plan' } as const, null, { shap
 const model = atom({ plugin: 'session-deck', key: 'model' } as const, null, { shape: 'model-1' })
 const agents = atom({ plugin: 'session-deck', key: 'agents' } as const, [], { shape: 'agents-1' })
 const nudge = atom({ plugin: 'session-deck', key: 'nudge' } as const, null, { shape: 'nudge-1' })
+const checklist = atom(
+  { plugin: 'session-deck', key: 'checklist' } as const,
+  { ticked: [], isBriefed: false },
+  { shape: 'checklist-1' },
+)
 const clock = atom({ plugin: 'session-deck', key: 'now' } as const, 0)
 
 const LIMIT_LABELS: Record<string, string> = { five_hour: '5h', seven_day: '7d', spend_limit: 'spend' }
@@ -59,7 +64,25 @@ const storeKey = (path: string) => `plan:${path}`
 
 type StatusMode = 'full' | 'limits' | 'off'
 
-type Settings = { handoffAt: number; warnAt: number; statusLine: StatusMode }
+type Check = { label: string; tool: string; match?: string }
+
+type Settings = { handoffAt: number; warnAt: number; statusLine: StatusMode; checks: Check[] }
+
+/**
+ * @return [Array<Check>] the items of a `Label=Tool` or `Label=Tool:path part` list split on
+ *   semicolons, skipping any that do not read that way
+ */
+function checksFrom(text: unknown): Check[] {
+  return String(text ?? '')
+    .split(/[;\n]/)
+    .map(part => /^\s*([^=]+?)\s*=\s*([^\s:]+)\s*(?::\s*(.+?))?\s*$/.exec(part))
+    .flatMap(found => {
+      const [, label, tool, match] = found ?? []
+      if (label === undefined || tool === undefined) return []
+
+      return [match === undefined ? { label, tool } : { label, tool, match }]
+    })
+}
 
 /**
  * @return [Settings] the manifest's userConfig values, with the early warning 10 points
@@ -69,7 +92,7 @@ function settingsFrom(options: PluginOptions): Settings {
   const handoffAt = Math.min(95, Math.max(10, Math.round(Number(options.handoffAt) || 50)))
   const statusLine = options.statusLine === 'limits' || options.statusLine === 'off' ? options.statusLine : 'full'
 
-  return { handoffAt, warnAt: handoffAt - 10, statusLine }
+  return { handoffAt, warnAt: handoffAt - 10, statusLine, checks: checksFrom(options.checklist) }
 }
 
 const toUsage = (context: SessionContextUsage, limits: readonly SessionRateLimit[]): Usage => ({
@@ -103,6 +126,41 @@ const reachedHandoff = (before: Usage | null, after: Usage, { warnAt, handoffAt 
 const handoffNote = (percent: number | undefined, handoffAt: number) =>
   `session-deck: context is at ${percent ?? handoffAt}%, past the ${handoffAt}% handoff mark. ` +
   'Tell the person, finish the step in hand, then prepare the handoff before starting anything new.'
+
+const meets = ({ tool, match }: Check, called: string, input: Record<string, unknown>) =>
+  tool === called && (match === undefined || Object.values(input).some(v => typeof v === 'string' && v.includes(match)))
+
+const checklistNote = (open: readonly Check[]) =>
+  "session-deck: this person's checklist for the start of every session, before any other work: " +
+  open.map(c => `${c.label} (${c.match === undefined ? c.tool : `${c.tool} on a path containing ${c.match}`})`).join(', ') +
+  '. Do these first, then go on to what they asked.'
+
+/**
+ * @return [Array<String>] the open checklist items for Claude, on the first prompt of a session only
+ */
+async function briefing($: EngineInterface, checks: readonly Check[]): Promise<string[]> {
+  if (checks.length === 0) return []
+
+  const held = await read($, checklist)
+  if (held.isBriefed) return []
+
+  await update($, checklist, last => ({ ...last, isBriefed: true }))
+  const open = checks.filter(c => !held.ticked.includes(c.label))
+
+  return open.length === 0 ? [] : [checklistNote(open)]
+}
+
+/**
+ * @return [Array<String>] the handoff note for Claude, once the context crossed the mark
+ */
+async function handoffNotes($: EngineInterface, handoffAt: number): Promise<string[]> {
+  if ((await read($, nudge)) !== 'due') return []
+
+  const percent = (await read($, usage))?.percent
+  await update($, nudge, () => 'sent')
+
+  return [handoffNote(percent, handoffAt)]
+}
 
 function alerts(before: Usage | null, after: Usage, at: number, { warnAt, handoffAt }: Settings): string[] {
   const lines: string[] = []
@@ -439,12 +497,11 @@ export const register: Register = (on, options) => {
   })
 
   on('prompt.submit', async ($, e, next) => {
-    if (e.command !== undefined || e.isMeta || (await read($, nudge)) !== 'due') return next(e)
+    if (e.command !== undefined || e.isMeta) return next(e)
 
-    const percent = (await read($, usage))?.percent
-    await update($, nudge, () => 'sent')
+    const notes = [...(await briefing($, settings.checks)), ...(await handoffNotes($, settings.handoffAt))]
 
-    return next({ ...e, context: [...(e.context ?? []), handoffNote(percent, settings.handoffAt)] })
+    return notes.length === 0 ? next(e) : next({ ...e, context: [...(e.context ?? []), ...notes] })
   }).catch(($, e, next) => next(e))
 
   on('turn.step', async function* ($, e, next) {
@@ -487,7 +544,16 @@ export const register: Register = (on, options) => {
       )
     }
 
-    return next(e)
+    const ran = await next(e)
+    const met = settings.checks.filter(c => meets(c, e.tool, e as Record<string, unknown>)).map(c => c.label)
+
+    if (met.length > 0 && ran.deny === undefined && ran.isError !== true) {
+      await update($, checklist, last => ({ ...last, ticked: [...new Set([...last.ticked, ...met])] })).catch(
+        () => undefined,
+      )
+    }
+
+    return ran
   }).catch(($, e, next) => next(e))
 
   on('classic.Stop', async ($, e, next) => {
@@ -559,13 +625,14 @@ export const register: Register = (on, options) => {
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const { Box, Text } = $.ui.resolve(e)
-    const [u, r, w, p, m, a, ticked] = await Promise.all([
+    const [u, r, w, p, m, a, held, ticked] = await Promise.all([
       read($, usage),
       read($, routines),
       read($, wakeups),
       read($, plan),
       read($, model),
       read($, agents),
+      read($, checklist),
       read($, clock),
     ])
     const at = ticked || (await $.clock.now())
@@ -588,6 +655,8 @@ export const register: Register = (on, options) => {
     const resetWidth = Math.max(0, ...resets.map(reset => reset.length))
     const checked = r === null ? 0 : Math.max(0, at - r.fetchedAt)
     const scheduled = w.crons.length + w.jobs.length
+    const checksDone = settings.checks.filter(c => held.ticked.includes(c.label)).length
+    const isChecked = checksDone === settings.checks.length
 
     const done = p?.tasks.filter(t => t.status === 'done').length ?? 0
     const firstOpen = Math.max(0, p?.tasks.findIndex(t => t.status !== 'done') ?? 0)
@@ -605,6 +674,19 @@ export const register: Register = (on, options) => {
             {m.effort !== undefined && <Text dimColor>  {m.effort} effort</Text>}
           </Text>
         )}
+
+        {settings.checks.length > 0 &&
+          section('Checklist', isChecked ? 'all done' : `${checksDone} of ${settings.checks.length} done`, isChecked ? 'success' : 'warning')}
+        {!isChecked &&
+          settings.checks.map(c => {
+            const isTicked = held.ticked.includes(c.label)
+
+            return (
+              <Text dimColor={isTicked}>
+                <Text color={isTicked ? 'success' : undefined}>{isTicked ? '✓' : '·'}</Text> {c.label}
+              </Text>
+            )
+          })}
 
         {section('Context', u?.percent === undefined ? 'no reading' : `${u.percent}%`, contextTone)}
         {u?.percent !== undefined && contextTone !== undefined && (

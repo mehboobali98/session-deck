@@ -423,3 +423,69 @@ for (const [statusLine, expected] of [
     expect(lines).toEqual([expected])
   })
 }
+
+const CHECKLIST = { checklist: 'Inbox=mcp__claude_ai_Gmail__search_threads; Status file=Read:status/job-search.md' }
+
+test('a checklist from the settings ticks off as its tools run', { options: CHECKLIST }, async ($, on) => {
+  mock.clock(on, { now: NOW })
+  on('tool.call', () => ({ result: {} }))
+
+  await $.tool.call({ tool: 'Read', file_path: '/work/status/job-search.md' })
+
+  for (const surface of SURFACES) {
+    const ui = await $.ui.mount({ ...PANE, surface })
+    expect(await ui.find({ type: 'Text', text: '1 of 2 done' })).toBeDefined()
+    expect((await ui.find({ type: 'Text', text: /Status file/ }))?.text).toContain('✓')
+    expect((await ui.find({ type: 'Text', text: /Inbox/ }))?.text).toContain('·')
+    await ui.unmount()
+  }
+})
+
+test('a finished checklist folds to its heading', { options: { checklist: 'Status file=Read:status/job-search.md' } }, async ($, on) => {
+  mock.clock(on, { now: NOW })
+  on('tool.call', () => ({ result: {} }))
+
+  await $.tool.call({ tool: 'Read', file_path: '/work/status/job-search.md' })
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: 'all done' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /Status file/ })).toBeUndefined()
+  await ui.unmount()
+})
+
+test('a call to another file does not tick a checklist item', { options: CHECKLIST }, async ($, on) => {
+  mock.clock(on, { now: NOW })
+  on('tool.call', () => ({ result: {} }))
+
+  await $.tool.call({ tool: 'Read', file_path: '/work/README.md' })
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: '0 of 2 done' })).toBeDefined()
+  await ui.unmount()
+})
+
+test('the first prompt of a session carries the open checklist items for Claude, once', { options: CHECKLIST }, async ($, on) => {
+  on('prompt.submit', (_, e) => ({ text: e.text, context: e.context }))
+
+  const first = await $.prompt.submit({ text: 'continue the plugin', wait: false, origin: COMPOSER })
+  const second = await $.prompt.submit({ text: 'and then', wait: false, origin: COMPOSER })
+
+  expect(first.context).toEqual([
+    "session-deck: this person's checklist for the start of every session, before any other work: " +
+      'Inbox (mcp__claude_ai_Gmail__search_threads), Status file (Read on a path containing status/job-search.md). ' +
+      'Do these first, then go on to what they asked.',
+  ])
+  expect(second.context).toBeUndefined()
+})
+
+test('without a checklist setting there is no checklist', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  on('prompt.submit', (_, e) => ({ text: e.text, context: e.context }))
+
+  const sent = await $.prompt.submit({ text: 'hello', wait: false, origin: COMPOSER })
+
+  expect(sent.context).toBeUndefined()
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /^Checklist/ })).toBeUndefined()
+  await ui.unmount()
+})
