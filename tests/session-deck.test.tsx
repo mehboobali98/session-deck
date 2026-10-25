@@ -98,8 +98,12 @@ test('context and limits show as bars, with a toast past the handoff mark', asyn
 
   for (const surface of SURFACES) {
     const ui = await $.ui.mount({ ...PANE, surface })
-    expect((await ui.find({ type: 'Text', text: /handoff at 50%/ }))?.text).toContain('52%')
+    expect(await ui.find({ type: 'Text', text: '520k of 1M tokens' })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: 'handoff at 50%' })).toBeDefined()
+    const ticks = await ui.findAll({ type: 'Text', text: '┃' })
+    expect(ticks.some(tick => tick.props.color === 'warning')).toBe(true)
     expect((await ui.find({ type: 'Text', text: /^5h/ }))?.text).toContain('82%')
+    expect(await ui.find({ type: 'Text', text: '5h 82%' })).toBeDefined()
     await ui.unmount()
   }
 })
@@ -189,7 +193,8 @@ test('the model and effort of the latest main request show under Model', async (
 
   for (const surface of SURFACES) {
     const ui = await $.ui.mount({ ...PANE, surface })
-    expect(await ui.find({ type: 'Text', text: 'Opus 5.5 (1M) · xhigh' })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /^Opus 5\.5 \(1M\)/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: 'xhigh effort' })).toBeDefined()
     await ui.unmount()
   }
 })
@@ -208,7 +213,7 @@ test('a running subagent shows its type, model, effort, task and current tool', 
     const ui = await $.ui.mount({ ...PANE, surface })
     const row = (await ui.find({ type: 'Text', text: /scout/ }))?.text
     expect(row).toContain('▸')
-    expect(row).toContain('haiku · low')
+    expect(row).toContain('haiku low')
     expect(row).toContain('find session-deck files')
     expect(await ui.find({ type: 'Text', text: /↳ Read register.tsx/ })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: '1 running' })).toBeDefined()
@@ -270,6 +275,18 @@ test('a limit on pace to run out before its reset says when, with one toast per 
   ])
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   expect((await ui.find({ type: 'Text', text: /at this pace/ }))?.text).toContain('before reset')
+  const trail = await ui.findAll({ type: 'Text', text: /┅/ })
+  expect(trail.some(dash => dash.props.color === 'error')).toBe(true)
+  await ui.unmount()
+})
+
+test('a quiet session shows its empty sections as single headings', async ($, on) => {
+  mock.clock(on, { now: NOW })
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /No crons/ })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: /None this session/ })).toBeUndefined()
+  expect((await ui.findAll({ type: 'Text', text: 'none' })).length).toBeGreaterThanOrEqual(2)
   await ui.unmount()
 })
 

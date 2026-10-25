@@ -1,6 +1,6 @@
 export type Limit = { kind: string; percentUsed: number; resetsAt?: string }
 
-export type Usage = { percent?: number; window: number; limits: Limit[] }
+export type Usage = { percent?: number; tokens?: number; window: number; limits: Limit[] }
 
 export type Routine = {
   id: string
