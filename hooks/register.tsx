@@ -5,9 +5,10 @@ import type {
   Register,
   SessionContextUsage,
   SessionRateLimit,
+  TurnStepInput,
 } from 'claude-code'
 
-import type { Plan, Routine, TaskStatus, Usage } from '../types'
+import type { Agent, Effort, Limit, Plan, Routine, TaskStatus, Usage } from '../types'
 
 const PANE = 'session-deck'
 const TITLE = 'Session'
@@ -18,6 +19,11 @@ const LIMIT_WARN_AT = 80
 const LIMIT_ALARM_AT = 95
 const ROUTINE_REFRESH_MS = 30 * 60_000
 const PLAN_ROWS = 8
+const AGENTS_KEPT = 4
+const HOUR_MS = 3_600_000
+const WINDOW_MS: Record<string, number> = { five_hour: 5 * HOUR_MS, seven_day: 7 * 24 * HOUR_MS }
+const COSTLY_MODEL = /opus|fable/i
+const ARG_KEYS = ['description', 'pattern', 'file_path', 'command', 'query', 'url'] as const
 
 const PLAN_TOOL_DESCRIPTION =
   "Marks a task of the implementation plan in the person's session deck pane as todo, doing or done. " +
@@ -35,6 +41,9 @@ const wakeups = atom(
   { shape: 'wakeups-1' },
 )
 const plan = atom({ plugin: 'session-deck', key: 'plan' } as const, null, { shape: 'plan-1' })
+const model = atom({ plugin: 'session-deck', key: 'model' } as const, null, { shape: 'model-1' })
+const agents = atom({ plugin: 'session-deck', key: 'agents' } as const, [], { shape: 'agents-1' })
+const nudge = atom({ plugin: 'session-deck', key: 'nudge' } as const, null, { shape: 'nudge-1' })
 const clock = atom({ plugin: 'session-deck', key: 'now' } as const, 0)
 
 const LIMIT_LABELS: Record<string, string> = { five_hour: '5h', seven_day: '7d', spend_limit: 'spend' }
@@ -85,6 +94,13 @@ function crossed(before: number | undefined, after: number | undefined, marks: n
   return marks.filter(mark => (before ?? 0) < mark && (after ?? 0) >= mark).pop()
 }
 
+const reachedHandoff = (before: Usage | null, after: Usage, { warnAt, handoffAt }: Settings) =>
+  crossed(before?.percent, after.percent, [warnAt, handoffAt]) === handoffAt
+
+const handoffNote = (percent: number | undefined, handoffAt: number) =>
+  `session-deck: context is at ${percent ?? handoffAt}%, past the ${handoffAt}% handoff mark. ` +
+  'Tell the person, finish the step in hand, then prepare the handoff before starting anything new.'
+
 function alerts(before: Usage | null, after: Usage, at: number, { warnAt, handoffAt }: Settings): string[] {
   const lines: string[] = []
   const mark = crossed(before?.percent, after.percent, [warnAt, handoffAt])
@@ -122,6 +138,108 @@ function relative(iso: string, at: number): string {
   if (Number.isNaN(ms)) return ''
 
   return ms >= 0 ? `in ${span(ms)}` : `${span(-ms)} ago`
+}
+
+/**
+ * @return [String, undefined] when the limit runs out at its pace since the window opened, or
+ *   undefined when it lasts to its reset or the window is too young to tell
+ */
+function pace(limit: Limit, at: number): string | undefined {
+  const length = WINDOW_MS[limit.kind]
+  const resetsAt = Date.parse(limit.resetsAt ?? '')
+  const used = limit.percentUsed
+  if (length === undefined || Number.isNaN(resetsAt) || used <= 0 || used >= 100) return undefined
+
+  const elapsed = at - (resetsAt - length)
+  if (elapsed < length / 5) return undefined
+
+  const outAt = at + ((100 - used) / used) * elapsed
+
+  return outAt < resetsAt
+    ? `runs out in ~${span(outAt - at)} at this pace, ${span(resetsAt - outAt)} before reset`
+    : undefined
+}
+
+/**
+ * @return [Array<String>] a toast for each limit newly on pace to run out before its reset,
+ *   once per window across sessions
+ */
+async function paceAlerts($: EngineInterface, limits: readonly Limit[], at: number): Promise<string[]> {
+  const lines: string[] = []
+
+  for (const limit of limits) {
+    const text = pace(limit, at)
+    const key = `paced:${limit.kind}`
+    if (text === undefined || (await $.store.get(key)) === limit.resetsAt) continue
+
+    await $.store.set(key, limit.resetsAt)
+    lines.push(`${label(limit.kind)} limit ${text}`)
+  }
+
+  return lines
+}
+
+/**
+ * @return [String] a model id as people say it: `claude-opus-5-5[1m]` is "Opus 5.5 (1M)"
+ */
+function modelName(id: string): string {
+  const match = /(opus|sonnet|haiku|fable)-(\d+)(?:-(\d{1,2})(?!\d))?/i.exec(id)
+  const family = match?.[1]
+  if (family === undefined) return id
+
+  const version = match?.[3] === undefined ? match?.[2] : `${match[2]}.${match[3]}`
+  const name = `${family.charAt(0).toUpperCase()}${family.slice(1).toLowerCase()} ${version ?? ''}`.trim()
+
+  return /\[1m\]/i.test(id) ? `${name} (1M)` : name
+}
+
+const modelFamily = (id: string) => /opus|sonnet|haiku|fable/i.exec(id)?.[0]?.toLowerCase() ?? id
+
+const withEffort = (name: string, effort: Effort | undefined) =>
+  effort === undefined ? name : `${name} · ${effort}`
+
+/**
+ * @return [String] the tool and the argument that says most about the call, `Read register.tsx`
+ */
+function doing(tool: string, input: Record<string, unknown>): string {
+  const key = ARG_KEYS.find(k => typeof input[k] === 'string' && (input[k] as string).trim() !== '')
+  if (key === undefined) return tool
+
+  const arg = String(input[key]).replace(/\s+/g, ' ').trim()
+
+  return `${tool} ${key === 'file_path' ? (arg.split('/').pop() ?? arg) : arg}`
+}
+
+/**
+ * @return [Array<Agent>] the running agents, then the newest finished ones
+ */
+function kept(list: readonly Agent[]): Agent[] {
+  const running = list.filter(a => a.isRunning)
+  const finished = list.filter(a => !a.isRunning).sort((a, b) => (b.finishedAt ?? 0) - (a.finishedAt ?? 0))
+
+  return [...running, ...finished.slice(0, AGENTS_KEPT)]
+}
+
+const finish = ({ doing: _doing, ...agent }: Agent, at: number): Agent => ({ ...agent, isRunning: false, finishedAt: at })
+
+function agentCounts(list: readonly Agent[]): string {
+  const running = list.filter(a => a.isRunning).length
+  const finished = list.length - running
+
+  return [running > 0 ? `${running} running` : '', finished > 0 ? `${finished} done` : ''].filter(Boolean).join(' · ')
+}
+
+async function noteStep($: EngineInterface, e: TurnStepInput): Promise<void> {
+  const ran = e.effort === undefined ? { model: e.model } : { model: e.model, effort: e.effort }
+  const id = e.agentId
+
+  if (id === undefined) {
+    const last = await read($, model)
+    if (last?.model !== ran.model || last.effort !== e.effort) await update($, model, () => ran)
+    return
+  }
+
+  await update($, agents, list => list.map(a => (a.id === id ? { ...a, ...ran } : a)))
 }
 
 const fit = (text: string, width: number) =>
@@ -287,10 +405,66 @@ export const register: Register = (on, options) => {
 
     await update($, usage, () => after)
     $.ui.status(statusText(after, settings.statusLine))
-    for (const line of alerts(before, after, at, settings)) $.ui.toast(line, { timeoutMs: 8000 })
+    if (reachedHandoff(before, after, settings)) await update($, nudge, () => 'due')
+
+    const paced = await paceAlerts($, after.limits, at).catch(() => [])
+    const lines = [...alerts(before, after, at, settings), ...paced]
+    for (const line of lines) $.ui.toast(line, { timeoutMs: 8000 })
 
     return next(e)
   })
+
+  on('prompt.submit', async ($, e, next) => {
+    if (e.command !== undefined || e.isMeta || (await read($, nudge)) !== 'due') return next(e)
+
+    const percent = (await read($, usage))?.percent
+    await update($, nudge, () => 'sent')
+
+    return next({ ...e, context: [...(e.context ?? []), handoffNote(percent, settings.handoffAt)] })
+  }).catch(($, e, next) => next(e))
+
+  on('turn.step', async function* ($, e, next) {
+    await noteStep($, e).catch(() => undefined)
+
+    return yield* next(e)
+  })
+
+  on('agent.spawn', async ($, e, next) => {
+    const spawned = await next(e)
+
+    if (spawned.deny === undefined && spawned.agentId !== undefined) {
+      const row: Agent = {
+        id: spawned.agentId,
+        type: e.subagentType,
+        description: e.description,
+        model: spawned.model,
+        isRunning: true,
+      }
+      await update($, agents, list => kept([row, ...list.filter(a => a.id !== row.id)]))
+    }
+
+    return spawned
+  }).catch(($, e, next) => next(e))
+
+  on('classic.SubagentStop', async ($, e, next) => {
+    const at = await $.clock.now()
+    await update($, agents, list => kept(list.map(a => (a.id === e.agent_id ? finish(a, at) : a))))
+
+    return next(e)
+  }).catch(($, e, next) => next(e))
+
+  on('tool.call', async ($, e, next) => {
+    const id = e.agentId
+
+    if (id !== undefined) {
+      const now = doing(e.tool, e as Record<string, unknown>)
+      await update($, agents, list => list.map(a => (a.id === id && a.isRunning ? { ...a, doing: now } : a))).catch(
+        () => undefined,
+      )
+    }
+
+    return next(e)
+  }).catch(($, e, next) => next(e))
 
   on('classic.Stop', async ($, e, next) => {
     await update($, wakeups, () => ({
@@ -361,11 +535,13 @@ export const register: Register = (on, options) => {
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const { Box, Text } = $.ui.resolve(e)
-    const [u, r, w, p, ticked] = await Promise.all([
+    const [u, r, w, p, m, a, ticked] = await Promise.all([
       read($, usage),
       read($, routines),
       read($, wakeups),
       read($, plan),
+      read($, model),
+      read($, agents),
       read($, clock),
     ])
     const at = ticked || (await $.clock.now())
@@ -386,7 +562,10 @@ export const register: Register = (on, options) => {
 
     return (
       <Box flexDirection="column">
-        <Text weight="bold">Context</Text>
+        <Text weight="bold">Model</Text>
+        {m === null ? <Text dimColor>No reply yet</Text> : <Text>{withEffort(modelName(m.model), m.effort)}</Text>}
+
+        {heading('Context')}
         {u?.percent === undefined ? (
           <Text dimColor>No reading yet</Text>
         ) : (
@@ -398,14 +577,21 @@ export const register: Register = (on, options) => {
 
         {heading('Limits')}
         {(u?.limits.length ?? 0) === 0 && <Text dimColor>No reading yet</Text>}
-        {(u?.limits ?? []).map(l => (
-          <Text>
-            {label(l.kind).padEnd(3)}{' '}
-            <Text color={tone(l.percentUsed, LIMIT_WARN_AT, LIMIT_ALARM_AT)}>{bar(l.percentUsed, barWidth)}</Text>{' '}
-            {Math.round(l.percentUsed)}%
-            {l.resetsAt !== undefined && <Text dimColor>  resets {relative(l.resetsAt, at)}</Text>}
-          </Text>
-        ))}
+        {(u?.limits ?? []).map(l => {
+          const ahead = pace(l, at)
+
+          return (
+            <Box flexDirection="column">
+              <Text>
+                {label(l.kind).padEnd(3)}{' '}
+                <Text color={tone(l.percentUsed, LIMIT_WARN_AT, LIMIT_ALARM_AT)}>{bar(l.percentUsed, barWidth)}</Text>{' '}
+                {Math.round(l.percentUsed)}%
+                {l.resetsAt !== undefined && <Text dimColor>  resets {relative(l.resetsAt, at)}</Text>}
+              </Text>
+              {ahead !== undefined && <Text color="warning">    {ahead}</Text>}
+            </Box>
+          )
+        })}
 
         {heading('Plan')}
         {p === null ? (
@@ -428,6 +614,33 @@ export const register: Register = (on, options) => {
             {planRest > 0 && <Text dimColor>  … {planRest} more</Text>}
           </Box>
         )}
+
+        {heading('Agents')}
+        <Text dimColor>{a.length === 0 ? 'None this session' : agentCounts(a)}</Text>
+        {a.map(agent => {
+          const runsOn = agent.model === undefined ? undefined : withEffort(modelFamily(agent.model), agent.effort)
+          const when = agent.isRunning ? '' : `${span(Math.max(0, at - (agent.finishedAt ?? at)))} ago`
+          const room = Math.max(8, cols - agent.type.length - (runsOn?.length ?? 0) - when.length - 6)
+          const isCostly = COSTLY_MODEL.test(agent.model ?? '')
+
+          return (
+            <Box flexDirection="column">
+              <Box justifyContent="space-between">
+                <Text>
+                  <Text color={agent.isRunning ? 'claude' : 'success'}>{agent.isRunning ? '▸' : '✓'}</Text> {agent.type}{' '}
+                  {runsOn !== undefined && (
+                    <Text color={isCostly ? 'warning' : undefined} dimColor={!isCostly}>
+                      {runsOn}
+                    </Text>
+                  )}{' '}
+                  {fit(agent.description, room)}
+                </Text>
+                {when !== '' && <Text dimColor>{when}</Text>}
+              </Box>
+              {agent.isRunning && agent.doing !== undefined && <Text dimColor>  ↳ {fit(agent.doing, cols - 4)}</Text>}
+            </Box>
+          )
+        })}
 
         {heading('Scheduled here')}
         {w.crons.length === 0 && w.jobs.length === 0 && <Text dimColor>No crons, wakeups or background jobs</Text>}
