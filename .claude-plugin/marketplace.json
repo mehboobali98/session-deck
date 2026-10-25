@@ -1,0 +1,11 @@
+{
+  "name": "session-deck",
+  "owner": { "name": "Mehboob Ali" },
+  "plugins": [
+    {
+      "name": "session-deck",
+      "source": "./",
+      "description": "A pane beside the chat with context fill, plan usage limits, implementation plan progress and scheduled tasks"
+    }
+  ]
+}
