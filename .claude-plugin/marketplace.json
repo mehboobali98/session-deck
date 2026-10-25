@@ -1,6 +1,7 @@
 {
   "name": "session-deck",
   "owner": { "name": "Mehboob Ali" },
+  "description": "session-deck, a Claude Code mod that keeps a pane of session vitals beside the chat",
   "plugins": [
     {
       "name": "session-deck",
