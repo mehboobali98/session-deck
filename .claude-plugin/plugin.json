@@ -1,6 +1,6 @@
 {
   "name": "session-deck",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "A pane beside the chat with context fill, plan usage limits, implementation plan progress and scheduled tasks",
   "types": "./types/index.d.ts",
   "userConfig": {

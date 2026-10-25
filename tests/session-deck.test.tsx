@@ -154,6 +154,29 @@ test('crons and wakeups from the end of a turn are listed', async ($, on) => {
   await ui.unmount()
 })
 
+test('a /clear puts the status line and routines back for the new session', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const lines: (string | undefined)[] = []
+  on('ui.status', (_, e) => (lines.push(e.text), { value: undefined }))
+  on('session.usage', () => ({
+    value: {
+      startedAt: NOW,
+      context: { window: 1_000_000, tokens: 0 },
+      rateLimits: [{ kind: 'seven_day', percentUsed: 85 }],
+    },
+  }))
+  on('tool.call', () => ({ result: {}, text: ROUTINES }))
+  on('classic.SessionStart', () => ({}))
+
+  await $.classic.SessionStart({ source: 'clear' })
+  await clock.settle()
+
+  expect(lines).toEqual(['7d 85%'])
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /Daily digest/ })).toBeDefined()
+  await ui.unmount()
+})
+
 const MEASURE: SessionMeasureInput = {
   context: { window: 1_000_000, tokens: 620_000, percent: 62 },
   rateLimits: [{ kind: 'five_hour', percentUsed: 30 }],

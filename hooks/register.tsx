@@ -222,6 +222,14 @@ async function tick($: EngineInterface): Promise<void> {
   await update($, clock, () => at)
 }
 
+async function seed($: EngineInterface, mode: StatusMode): Promise<void> {
+  const { context, rateLimits } = await $.session.usage()
+  const seeded = toUsage(context, rateLimits)
+  await update($, usage, () => seeded)
+  $.ui.status(statusText(seeded, mode))
+  await tick($)
+}
+
 export const register: Register = (on, options) => {
   const settings = settingsFrom(options)
 
@@ -244,11 +252,7 @@ export const register: Register = (on, options) => {
       isDeferred: false,
     })
 
-    const { context, rateLimits } = await $.session.usage()
-    const seeded = toUsage(context, rateLimits)
-    await update($, usage, () => seeded)
-    $.ui.status(statusText(seeded, settings.statusLine))
-    await tick($)
+    await seed($, settings.statusLine)
 
     if (e.isInteractive) {
       $.clock.every(60_000, () => void tick($))
@@ -259,6 +263,15 @@ export const register: Register = (on, options) => {
 
     return next(e)
   })
+
+  on('classic.SessionStart', async ($, e, next) => {
+    if (e.source === 'clear') {
+      await seed($, settings.statusLine)
+      $.clock.after(0, () => void refreshRoutines($))
+    }
+
+    return next(e)
+  }).catch(($, e, next) => next(e))
 
   on('command.run', { command: 'deck' }, async $ => {
     const opened = await $.ui.open({ id: PANE, title: TITLE })
