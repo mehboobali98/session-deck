@@ -5,14 +5,14 @@ A Claude Code mod that keeps a pane beside the chat with the things I kept stopp
 ## What it shows
 
 - **Model**: the model and effort the last request of the main session ran on.
-- **Context**: the live window's fill as a bar, against a 50% handoff mark. A toast fires at 40% and again at 50%. At 50% the mod also adds one note to your next prompt, telling Claude to say so, finish the step in hand and prepare the handoff.
-- **Limits**: the 5-hour and weekly windows, with the time until each one resets. A toast fires at 80% and 95%. When a window is on pace to run out before it resets, a line under it says when, worked out from the use since the window opened, and a toast says so once per window. The forecast waits until a fifth of the window has passed.
+- **Context**: the live window's fill and tokens used, as a gauge with a tick at the 50% handoff mark. A toast fires at 40% and again at 50%. At 50% the mod also adds one note to your next prompt, telling Claude to say so, finish the step in hand and prepare the handoff.
+- **Limits**: the 5-hour and weekly windows, with the time until each one resets. A toast fires at 80% and 95%. When a window is on pace to run out before it resets, a red dashed trail runs to the end of its gauge, a line under it says when, worked out from the use since the window opened, and a toast says so once per window. The forecast waits until a fifth of the window has passed.
 - **Plan**: the tasks of the last `docs/superpowers/plans/*.md` file Claude read or wrote, taken from its `### Task N:` headings and marked done, in progress or to do. Claude marks them through the mod's `plan_progress` tool, so the plan file is never edited. Progress is stored per plan, so a later session that opens the same plan picks up where the last one stopped.
 - **Agents**: this session's subagents, running ones first: the agent type, the model and effort it actually ran on, its task, and while it runs, the tool it is on. A subagent on Opus or Fable is drawn in the warning color. The last four finished ones stay, with how long ago they finished.
 - **Scheduled here**: this session's crons, `/loop` wakeups and background jobs, as of the end of the last turn.
 - **Routines**: your cloud routines, with the time to each one's next run and how its last run went. Refreshed every 30 minutes and whenever Claude lists them.
 
-A status line under the prompt carries the short version: `ctx 31% · 5h 52% · 7d 28%`.
+Each section's heading carries its headline figure, so the headings alone tell you where things stand, and an empty section is just its heading. A status line under the prompt carries the short version: `ctx 31% · 5h 52% · 7d 28%`.
 
 ## Install
 

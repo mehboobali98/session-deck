@@ -1,6 +1,6 @@
 {
   "name": "session-deck",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "A pane beside the chat with the model in use, context fill, plan usage limits and their forecast, plan progress, subagents and scheduled tasks",
   "types": "./types/index.d.ts",
   "userConfig": {

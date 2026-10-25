@@ -24,6 +24,8 @@ const HOUR_MS = 3_600_000
 const WINDOW_MS: Record<string, number> = { five_hour: 5 * HOUR_MS, seven_day: 7 * 24 * HOUR_MS }
 const COSTLY_MODEL = /opus|fable/i
 const ARG_KEYS = ['description', 'pattern', 'file_path', 'command', 'query', 'url'] as const
+const ACCENT = 'suggestion'
+const TRACK = 'subtle'
 
 const PLAN_TOOL_DESCRIPTION =
   "Marks a task of the implementation plan in the person's session deck pane as todo, doing or done. " +
@@ -72,6 +74,7 @@ function settingsFrom(options: PluginOptions): Settings {
 
 const toUsage = (context: SessionContextUsage, limits: readonly SessionRateLimit[]): Usage => ({
   percent: context.percent,
+  tokens: context.tokens,
   window: context.window,
   limits: limits.map(({ kind, percentUsed, resetsAt }) => ({ kind, percentUsed, resetsAt })),
 })
@@ -195,8 +198,8 @@ function modelName(id: string): string {
 
 const modelFamily = (id: string) => /opus|sonnet|haiku|fable/i.exec(id)?.[0]?.toLowerCase() ?? id
 
-const withEffort = (name: string, effort: Effort | undefined) =>
-  effort === undefined ? name : `${name} · ${effort}`
+const runsOn = (id: string, effort: Effort | undefined) =>
+  effort === undefined ? modelFamily(id) : `${modelFamily(id)} ${effort}`
 
 /**
  * @return [String] the tool and the argument that says most about the call, `Read register.tsx`
@@ -226,7 +229,7 @@ function agentCounts(list: readonly Agent[]): string {
   const running = list.filter(a => a.isRunning).length
   const finished = list.length - running
 
-  return [running > 0 ? `${running} running` : '', finished > 0 ? `${finished} done` : ''].filter(Boolean).join(' · ')
+  return [running > 0 ? `${running} running` : '', finished > 0 ? `${finished} done` : ''].filter(Boolean).join(', ')
 }
 
 async function noteStep($: EngineInterface, e: TurnStepInput): Promise<void> {
@@ -245,10 +248,31 @@ async function noteStep($: EngineInterface, e: TurnStepInput): Promise<void> {
 const fit = (text: string, width: number) =>
   text.length > width ? `${text.slice(0, Math.max(1, width - 1))}…` : text
 
-function bar(percent: number, width: number): string {
-  const filled = Math.round((Math.min(100, Math.max(0, percent)) / 100) * width)
+type Run = { glyph: string; color: string }
 
-  return '█'.repeat(filled) + '░'.repeat(width - filled)
+/**
+ * @return [Array<Run>] a gauge `width` cells long, `percent` of it filled in `color` on a grey
+ *   track, with a warning tick at `tick` percent and, with `trail`, red dashes past the fill
+ */
+function gauge(width: number, percent: number, color: string, { tick, trail }: { tick?: number; trail?: boolean } = {}): Run[] {
+  const filled = Math.round((Math.min(100, Math.max(0, percent)) / 100) * width)
+  const cells = Array.from({ length: width }, (_, i): Run =>
+    i < filled ? { glyph: '━', color } : trail ? { glyph: '┅', color: 'error' } : { glyph: '━', color: TRACK },
+  )
+  if (tick !== undefined) cells[Math.min(width - 1, Math.round((tick / 100) * width))] = { glyph: '┃', color: 'warning' }
+
+  return cells.reduce<Run[]>((runs, cell) => {
+    const last = runs.at(-1)
+    if (last?.color === cell.color && last.glyph.at(-1) === cell.glyph) last.glyph += cell.glyph
+    else runs.push({ ...cell })
+    return runs
+  }, [])
+}
+
+function tokens(n: number): string {
+  if (n >= 1_000_000) return `${Number((n / 1_000_000).toFixed(1))}M`
+
+  return n >= 1_000 ? `${Math.round(n / 1_000)}k` : String(n)
 }
 
 const tone = (percent: number, warnAt: number, alarmAt: number) =>
@@ -546,13 +570,24 @@ export const register: Register = (on, options) => {
     ])
     const at = ticked || (await $.clock.now())
     const cols = e.props.bodyColumns
-    const barWidth = Math.max(6, Math.min(24, cols - 30))
 
-    const heading = (text: string) => (
-      <Box marginTop={1}>
-        <Text weight="bold">{text}</Text>
+    const section = (name: string, value: string, color?: string) => (
+      <Box marginTop={1} justifyContent="space-between">
+        <Text>
+          <Text weight="bold">{name}</Text> <Text color={TRACK}>{'─'.repeat(Math.max(1, cols - name.length - value.length - 2))}</Text>
+        </Text>
+        {color === undefined ? <Text dimColor>{value}</Text> : <Text color={color} weight="bold">{value}</Text>}
       </Box>
     )
+
+    const drawn = (runs: Run[]) => runs.map(run => <Text color={run.color}>{run.glyph}</Text>)
+
+    const contextTone = u?.percent === undefined ? undefined : tone(u.percent, settings.warnAt, settings.handoffAt)
+    const worst = [...(u?.limits ?? [])].sort((x, y) => y.percentUsed - x.percentUsed)[0]
+    const resets = (u?.limits ?? []).map(l => (l.resetsAt === undefined ? '' : `↻ ${relative(l.resetsAt, at).replace(/^in /, '')}`))
+    const resetWidth = Math.max(0, ...resets.map(reset => reset.length))
+    const checked = r === null ? 0 : Math.max(0, at - r.fetchedAt)
+    const scheduled = w.crons.length + w.jobs.length
 
     const done = p?.tasks.filter(t => t.status === 'done').length ?? 0
     const firstOpen = Math.max(0, p?.tasks.findIndex(t => t.status !== 'done') ?? 0)
@@ -562,50 +597,60 @@ export const register: Register = (on, options) => {
 
     return (
       <Box flexDirection="column">
-        <Text weight="bold">Model</Text>
-        {m === null ? <Text dimColor>No reply yet</Text> : <Text>{withEffort(modelName(m.model), m.effort)}</Text>}
-
-        {heading('Context')}
-        {u?.percent === undefined ? (
-          <Text dimColor>No reading yet</Text>
+        {m === null ? (
+          <Text dimColor>Waiting for the first reply</Text>
         ) : (
           <Text>
-            <Text color={tone(u.percent, settings.warnAt, settings.handoffAt)}>{bar(u.percent, barWidth)}</Text>{' '}
-            {u.percent}%<Text dimColor>  handoff at {settings.handoffAt}%</Text>
+            <Text weight="bold">{modelName(m.model)}</Text>
+            {m.effort !== undefined && <Text dimColor>  {m.effort} effort</Text>}
           </Text>
         )}
 
-        {heading('Limits')}
-        {(u?.limits.length ?? 0) === 0 && <Text dimColor>No reading yet</Text>}
-        {(u?.limits ?? []).map(l => {
+        {section('Context', u?.percent === undefined ? 'no reading' : `${u.percent}%`, contextTone)}
+        {u?.percent !== undefined && contextTone !== undefined && (
+          <Box flexDirection="column">
+            <Text>{drawn(gauge(cols, u.percent, contextTone, { tick: settings.handoffAt }))}</Text>
+            <Box justifyContent="space-between">
+              <Text dimColor>{u.tokens === undefined ? '' : `${tokens(u.tokens)} of ${tokens(u.window)} tokens`}</Text>
+              <Text dimColor>handoff at {settings.handoffAt}%</Text>
+            </Box>
+          </Box>
+        )}
+
+        {section(
+          'Limits',
+          worst === undefined ? 'no reading' : `${label(worst.kind)} ${Math.round(worst.percentUsed)}%`,
+          worst === undefined ? undefined : tone(worst.percentUsed, LIMIT_WARN_AT, LIMIT_ALARM_AT),
+        )}
+        {(u?.limits ?? []).map((l, i) => {
           const ahead = pace(l, at)
+          const reset = resets[i] ?? ''
+          const width = Math.max(6, cols - resetWidth - 12)
 
           return (
             <Box flexDirection="column">
-              <Text>
-                {label(l.kind).padEnd(3)}{' '}
-                <Text color={tone(l.percentUsed, LIMIT_WARN_AT, LIMIT_ALARM_AT)}>{bar(l.percentUsed, barWidth)}</Text>{' '}
-                {Math.round(l.percentUsed)}%
-                {l.resetsAt !== undefined && <Text dimColor>  resets {relative(l.resetsAt, at)}</Text>}
-              </Text>
+              <Box justifyContent="space-between">
+                <Text>
+                  {label(l.kind).padEnd(3)} {drawn(gauge(width, l.percentUsed, tone(l.percentUsed, LIMIT_WARN_AT, LIMIT_ALARM_AT), { trail: ahead !== undefined }))}{' '}
+                  {String(Math.round(l.percentUsed)).padStart(3)}%
+                </Text>
+                {reset !== '' && <Text dimColor>{reset.padStart(resetWidth)}</Text>}
+              </Box>
               {ahead !== undefined && <Text color="warning">    {ahead}</Text>}
             </Box>
           )
         })}
 
-        {heading('Plan')}
+        {section('Plan', p === null ? 'none' : `${done} of ${p.tasks.length} done`)}
         {p === null ? (
-          <Text dimColor>None yet. Opening a docs/superpowers/plans file loads it.</Text>
+          <Text dimColor>Reading a docs/superpowers/plans file starts it</Text>
         ) : (
           <Box flexDirection="column">
             <Text>{fit(p.title, cols)}</Text>
-            <Text dimColor>
-              {done} of {p.tasks.length} done
-            </Text>
             {planStart > 0 && <Text dimColor>  … {planStart} done above</Text>}
             {planRows.map(t => (
-              <Text dimColor={t.status === 'todo'}>
-                <Text color={t.status === 'done' ? 'success' : t.status === 'doing' ? 'claude' : undefined}>
+              <Text dimColor={t.status !== 'doing'}>
+                <Text color={t.status === 'done' ? 'success' : t.status === 'doing' ? ACCENT : undefined}>
                   {t.status === 'done' ? '✓' : t.status === 'doing' ? '▸' : '·'}
                 </Text>{' '}
                 {fit(`${t.n} ${t.title}`, cols - 2)}
@@ -615,24 +660,25 @@ export const register: Register = (on, options) => {
           </Box>
         )}
 
-        {heading('Agents')}
-        <Text dimColor>{a.length === 0 ? 'None this session' : agentCounts(a)}</Text>
+        {section('Agents', a.length === 0 ? 'none' : agentCounts(a))}
         {a.map(agent => {
-          const runsOn = agent.model === undefined ? undefined : withEffort(modelFamily(agent.model), agent.effort)
+          const model = agent.model === undefined ? undefined : runsOn(agent.model, agent.effort)
           const when = agent.isRunning ? '' : `${span(Math.max(0, at - (agent.finishedAt ?? at)))} ago`
-          const room = Math.max(8, cols - agent.type.length - (runsOn?.length ?? 0) - when.length - 6)
+          const room = Math.max(8, cols - agent.type.length - (model?.length ?? 0) - when.length - 7)
           const isCostly = COSTLY_MODEL.test(agent.model ?? '')
 
           return (
             <Box flexDirection="column">
               <Box justifyContent="space-between">
                 <Text>
-                  <Text color={agent.isRunning ? 'claude' : 'success'}>{agent.isRunning ? '▸' : '✓'}</Text> {agent.type}{' '}
-                  {runsOn !== undefined && (
+                  <Text color={agent.isRunning ? ACCENT : 'success'}>{agent.isRunning ? '▸' : '✓'}</Text>{' '}
+                  <Text weight="bold">{agent.type}</Text>{'  '}
+                  {model !== undefined && (
                     <Text color={isCostly ? 'warning' : undefined} dimColor={!isCostly}>
-                      {runsOn}
+                      {model}
                     </Text>
-                  )}{' '}
+                  )}
+                  {'  '}
                   {fit(agent.description, room)}
                 </Text>
                 {when !== '' && <Text dimColor>{when}</Text>}
@@ -642,8 +688,7 @@ export const register: Register = (on, options) => {
           )
         })}
 
-        {heading('Scheduled here')}
-        {w.crons.length === 0 && w.jobs.length === 0 && <Text dimColor>No crons, wakeups or background jobs</Text>}
+        {section('Scheduled', scheduled === 0 ? 'none' : String(scheduled))}
         {w.crons.map(c => (
           <Text>
             {c.isRecurring ? '⟳' : '◷'} <Text dimColor>{c.schedule}</Text> {fit(c.prompt, Math.max(8, cols - c.schedule.length - 3))}
@@ -655,8 +700,10 @@ export const register: Register = (on, options) => {
           </Text>
         ))}
 
-        {heading('Routines')}
-        {r === null && <Text dimColor>Checking…</Text>}
+        {section(
+          'Routines',
+          r === null ? 'checking' : r.items.length === 0 ? 'none' : checked < 60_000 ? 'checked just now' : `checked ${span(checked)} ago`,
+        )}
         {r?.error !== undefined && <Text color="warning">{fit(`Not refreshed: ${r.error}`, cols)}</Text>}
         {r?.items.map(item => {
           const glyph = !item.isEnabled ? ' ' : item.lastStatus === 'succeeded' ? '✓' : item.lastStatus === 'failed' ? '✗' : item.lastStatus === undefined ? '·' : '◌'
@@ -672,7 +719,6 @@ export const register: Register = (on, options) => {
             </Box>
           )
         })}
-        {r !== null && r.items.length > 0 && <Text dimColor>checked {span(Math.max(0, at - r.fetchedAt))} ago</Text>}
       </Box>
     )
   })
