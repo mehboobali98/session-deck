@@ -1,5 +1,6 @@
-import type { SessionMeasureInput } from 'claude-code'
+import type { On, SessionMeasureInput, TurnStepInput } from 'claude-code'
 import { expect, mock, test } from 'claude-code/testing'
+import type { Engine } from 'claude-code/testing'
 
 const NOW = Date.parse('2026-10-25T12:00:00Z')
 const PLAN_PATH = '/work/acme-cli/docs/superpowers/plans/2026-10-23-demo.md'
@@ -46,8 +47,33 @@ const PANE = {
 
 const SURFACES = ['terminal', 'desktop'] as const
 
+const SPAWN = {
+  tool_use_id: 'tu1',
+  prompt: 'Find where session-deck keeps its settings',
+  description: 'find session-deck files',
+  subagentType: 'scout',
+  provider: { plugin: 'engine', tier: 'core' },
+  parentModel: 'claude-opus-5-5',
+  background: false,
+  fork: false,
+} as const
+
+const answerSteps = (on: On) =>
+  on('turn.step', async function* (_, e) {
+    return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn', usage: null }
+  })
+
+async function runStep($: Engine, e: Pick<TurnStepInput, 'model' | 'effort' | 'agentId'>) {
+  const stream = $.turn.step({ turnId: 't1', index: 0, messageCount: 3, ...e })
+  for await (const _ of stream);
+  return stream.result
+}
+
+const inHours = (hours: number) => new Date(NOW + hours * 3_600_000).toISOString()
+
 test('context and limits show as bars, with a toast past the handoff mark', async ($, on) => {
   mock.clock(on, { now: NOW })
+  mock.store(on)
   const toasts: string[] = []
   const lines: (string | undefined)[] = []
   on('ui.toast', (_, e) => (toasts.push(e.text), { value: undefined }))
@@ -67,6 +93,7 @@ test('context and limits show as bars, with a toast past the handoff mark', asyn
   expect(toasts).toEqual([
     'Context at 52%: write the handoff before starting anything new',
     '5h limit at 81.5%, resets in 2h 30m',
+    '5h limit runs out in ~34m at this pace, 1h 56m before reset',
   ])
 
   for (const surface of SURFACES) {
@@ -154,6 +181,137 @@ test('crons and wakeups from the end of a turn are listed', async ($, on) => {
   await ui.unmount()
 })
 
+test('the model and effort of the latest main request show under Model', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  answerSteps(on)
+
+  await runStep($, { model: 'claude-opus-5-5[1m]', effort: 'xhigh' })
+
+  for (const surface of SURFACES) {
+    const ui = await $.ui.mount({ ...PANE, surface })
+    expect(await ui.find({ type: 'Text', text: 'Opus 5.5 (1M) · xhigh' })).toBeDefined()
+    await ui.unmount()
+  }
+})
+
+test('a running subagent shows its type, model, effort, task and current tool', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  answerSteps(on)
+  on('agent.spawn', () => ({ model: 'claude-haiku-5-5', agentId: 'a1' }))
+  on('tool.call', () => ({ result: {} }))
+
+  await $.agent.spawn(SPAWN)
+  await runStep($, { model: 'claude-haiku-5-5', effort: 'low', agentId: 'a1' })
+  await $.tool.call({ tool: 'Read', file_path: '/work/acme-cli/hooks/register.tsx', agentId: 'a1' })
+
+  for (const surface of SURFACES) {
+    const ui = await $.ui.mount({ ...PANE, surface })
+    const row = (await ui.find({ type: 'Text', text: /scout/ }))?.text
+    expect(row).toContain('▸')
+    expect(row).toContain('haiku · low')
+    expect(row).toContain('find session-deck files')
+    expect(await ui.find({ type: 'Text', text: /↳ Read register.tsx/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: '1 running' })).toBeDefined()
+    await ui.unmount()
+  }
+})
+
+test('a finished subagent stays listed with how long ago it finished', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  on('agent.spawn', () => ({ model: 'claude-haiku-5-5', agentId: 'a1' }))
+  on('classic.SubagentStop', () => ({}))
+
+  await $.agent.spawn(SPAWN)
+  await $.classic.SubagentStop({
+    stop_hook_active: false,
+    agent_id: 'a1',
+    agent_type: 'scout',
+    agent_transcript_path: '/tmp/a1.jsonl',
+  })
+  await clock.advance(4 * 60_000)
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect((await ui.find({ type: 'Text', text: /scout/ }))?.text).toContain('✓')
+  expect(await ui.find({ type: 'Text', text: '4m ago' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: '1 done' })).toBeDefined()
+  await ui.unmount()
+})
+
+test('a subagent running on Opus is drawn in the warning color', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  on('agent.spawn', () => ({ model: 'claude-opus-5-5', agentId: 'a1' }))
+
+  await $.agent.spawn({ ...SPAWN, subagentType: 'general-purpose' })
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const marks = await ui.findAll({ type: 'Text', text: 'opus' })
+  expect(marks.some(mark => mark.props.color === 'warning')).toBe(true)
+  await ui.unmount()
+})
+
+test('a limit on pace to run out before its reset says when, with one toast per window', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  mock.store(on)
+  const toasts: string[] = []
+  on('ui.toast', (_, e) => (toasts.push(e.text), { value: undefined }))
+  on('ui.status', () => ({ value: undefined }))
+  on('session.measure', (_, e) => ({ changed: e.changed }))
+  const week = (percentUsed: number): SessionMeasureInput => ({
+    context: { window: 1_000_000, tokens: 50_000, percent: 5 },
+    rateLimits: [{ kind: 'seven_day', percentUsed, resetsAt: inHours(100) }],
+    changed: ['rateLimits'],
+  })
+
+  await $.session.measure(week(85))
+  await $.session.measure(week(86))
+
+  expect(toasts.filter(t => t.includes('at this pace'))).toEqual([
+    '7d limit runs out in ~12h 0m at this pace, 3d 16h before reset',
+  ])
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect((await ui.find({ type: 'Text', text: /at this pace/ }))?.text).toContain('before reset')
+  await ui.unmount()
+})
+
+test('a store that cannot be read still leaves the other toasts', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  const toasts: string[] = []
+  on('ui.toast', (_, e) => (toasts.push(e.text), { value: undefined }))
+  on('ui.status', () => ({ value: undefined }))
+  on('session.measure', (_, e) => ({ changed: e.changed }))
+
+  await $.session.measure({
+    context: { window: 1_000_000, tokens: 50_000, percent: 5 },
+    rateLimits: [{ kind: 'seven_day', percentUsed: 85, resetsAt: inHours(100) }],
+    changed: ['rateLimits'],
+  })
+
+  expect(toasts).toEqual(['7d limit at 85%, resets in 4d 4h'])
+})
+
+test('no forecast early in a window or for a limit that lasts to its reset', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  mock.store(on)
+  const toasts: string[] = []
+  on('ui.toast', (_, e) => (toasts.push(e.text), { value: undefined }))
+  on('ui.status', () => ({ value: undefined }))
+  on('session.measure', (_, e) => ({ changed: e.changed }))
+
+  await $.session.measure({
+    context: { window: 1_000_000, tokens: 50_000, percent: 5 },
+    rateLimits: [
+      { kind: 'five_hour', percentUsed: 10, resetsAt: inHours(4.5) },
+      { kind: 'seven_day', percentUsed: 20, resetsAt: inHours(100) },
+    ],
+    changed: ['rateLimits'],
+  })
+
+  expect(toasts.filter(t => t.includes('at this pace'))).toEqual([])
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /at this pace/ })).toBeUndefined()
+  await ui.unmount()
+})
+
 test('a /clear puts the status line and routines back for the new session', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
   const lines: (string | undefined)[] = []
@@ -182,6 +340,40 @@ const MEASURE: SessionMeasureInput = {
   rateLimits: [{ kind: 'five_hour', percentUsed: 30 }],
   changed: ['context', 'rateLimits'],
 }
+
+const COMPOSER = { kind: 'composer' } as const
+
+const NUDGE =
+  'session-deck: context is at 62%, past the 50% handoff mark. ' +
+  'Tell the person, finish the step in hand, then prepare the handoff before starting anything new.'
+
+test('crossing the handoff mark adds a note for Claude to the next prompt, once', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  on('ui.toast', () => ({ value: undefined }))
+  on('ui.status', () => ({ value: undefined }))
+  on('session.measure', (_, e) => ({ changed: e.changed }))
+  on('prompt.submit', (_, e) => ({ text: e.text, context: e.context }))
+
+  await $.session.measure(MEASURE)
+  const first = await $.prompt.submit({ text: 'next step', wait: false, origin: COMPOSER })
+  const second = await $.prompt.submit({ text: 'and then', wait: false, origin: COMPOSER })
+
+  expect(first.context).toEqual([NUDGE])
+  expect(second.context).toBeUndefined()
+})
+
+test('the early warning alone adds no note for Claude', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  on('ui.toast', () => ({ value: undefined }))
+  on('ui.status', () => ({ value: undefined }))
+  on('session.measure', (_, e) => ({ changed: e.changed }))
+  on('prompt.submit', (_, e) => ({ text: e.text, context: e.context }))
+
+  await $.session.measure({ ...MEASURE, context: { window: 1_000_000, tokens: 420_000, percent: 42 } })
+  const sent = await $.prompt.submit({ text: 'next step', wait: false, origin: COMPOSER })
+
+  expect(sent.context).toBeUndefined()
+})
 
 test('the handoff mark comes from the settings', { options: { handoffAt: 70 } }, async ($, on) => {
   mock.clock(on, { now: NOW })

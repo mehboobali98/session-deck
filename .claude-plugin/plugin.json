@@ -1,7 +1,7 @@
 {
   "name": "session-deck",
-  "version": "0.2.1",
-  "description": "A pane beside the chat with context fill, plan usage limits, implementation plan progress and scheduled tasks",
+  "version": "0.3.0",
+  "description": "A pane beside the chat with the model in use, context fill, plan usage limits and their forecast, plan progress, subagents and scheduled tasks",
   "types": "./types/index.d.ts",
   "userConfig": {
     "handoffAt": {
