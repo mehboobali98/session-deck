@@ -1,6 +1,6 @@
 {
   "name": "session-deck",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "A pane beside the chat with the model in use, context fill, plan usage limits and their forecast, plan progress, subagents and scheduled tasks",
   "types": "./types/index.d.ts",
   "userConfig": {
@@ -23,6 +23,12 @@
       "type": "string",
       "title": "Session checklist",
       "description": "Things to do at the start of every session, as Label=Tool or Label=Tool:path part, split by semicolons. The pane ticks each when its tool runs, and the first prompt of a session tells Claude what is still open",
+      "default": ""
+    },
+    "followUps": {
+      "type": "string",
+      "title": "Follow-ups",
+      "description": "A markdown file and heading, as path#Heading, whose bullets the pane lists, with when each dated one is due",
       "default": ""
     }
   }

@@ -287,6 +287,7 @@ test('a quiet session shows its empty sections as single headings', async ($, on
   expect(await ui.find({ type: 'Text', text: /No crons/ })).toBeUndefined()
   expect(await ui.find({ type: 'Text', text: /None this session/ })).toBeUndefined()
   expect((await ui.findAll({ type: 'Text', text: 'none' })).length).toBeGreaterThanOrEqual(2)
+  expect(await ui.find({ type: 'Text', text: /^Follow-ups/ })).toBeUndefined()
   await ui.unmount()
 })
 
@@ -489,3 +490,42 @@ test('without a checklist setting there is no checklist', async ($, on) => {
   expect(await ui.find({ type: 'Text', text: /^Checklist/ })).toBeUndefined()
   await ui.unmount()
 })
+
+const STATUS = [
+  '# Status',
+  '## Now',
+  '- not this one, 25 Oct',
+  '## Promised follow-ups',
+  '',
+  '- Send the **drafts** Mon 26 Oct morning (offered 24 Oct).',
+  '  more about the drafts',
+  '- Interview stories in packages/2026-10-24-stories.md: finish them once the gaps are answered.',
+  '- Chase [Wheely](https://example.com) on 2026-10-24.',
+  '## Notes',
+  '- not this either',
+].join('\n')
+
+test(
+  'follow-ups under the set heading show, the dated ones with when they are due',
+  { options: { followUps: '~/status/job-search.md#Promised follow-ups' } },
+  async ($, on) => {
+    mock.clock(on, { now: NOW })
+    mock.env(on, { HOME: '/home/me' })
+    const read: string[] = []
+    on('fs.read', (_, e) => (read.push(e.path), { value: STATUS }))
+    on('classic.Stop', () => ({}))
+
+    await $.classic.Stop({ stop_hook_active: false })
+
+    expect(read).toEqual(['/home/me/status/job-search.md'])
+    const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+    expect(await ui.find({ type: 'Text', text: '1 due' })).toBeDefined()
+    expect((await ui.find({ type: 'Text', text: /Chase Wheely on/ }))?.text).toContain('●')
+    expect(await ui.find({ type: 'Text', text: 'yesterday' })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /Send the drafts Mon 26 Oct/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: 'tomorrow' })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /Interview stories/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /not this|more about/ })).toBeUndefined()
+    await ui.unmount()
+  },
+)
