@@ -48,6 +48,10 @@ export type FollowUp = { text: string; due?: string }
 
 export type FollowUps = { items: FollowUp[]; error?: string }
 
+export type Part = { name: string; tokens: number }
+
+export type Fill = { parts: Part[]; results: Part[] }
+
 declare module 'claude-code' {
   interface PluginState {
     'session-deck': {
@@ -60,6 +64,7 @@ declare module 'claude-code' {
       nudge: Shaped<Nudge | null>
       checklist: Shaped<Checklist>
       followUps: Shaped<FollowUps | null>
+      fill: Shaped<Fill>
       now: number
     }
   }

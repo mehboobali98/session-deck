@@ -8,7 +8,7 @@ import type {
   TurnStepInput,
 } from 'claude-code'
 
-import type { Agent, Effort, FollowUp, Limit, Plan, Routine, TaskStatus, Usage } from '../types'
+import type { Agent, Effort, FollowUp, Limit, Part, Plan, Routine, TaskStatus, Usage } from '../types'
 
 const PANE = 'session-deck'
 const TITLE = 'Session'
@@ -27,6 +27,8 @@ const ARG_KEYS = ['description', 'pattern', 'file_path', 'command', 'query', 'ur
 const DAY_MS = 24 * HOUR_MS
 const MONTHS = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec']
 const FOLLOW_UP_ROWS = 6
+const FILL_PARTS = 3
+const RESULT_MIN_TOKENS = 1_000
 const ACCENT = 'suggestion'
 const TRACK = 'subtle'
 
@@ -55,6 +57,7 @@ const checklist = atom(
   { shape: 'checklist-1' },
 )
 const followUps = atom({ plugin: 'session-deck', key: 'followUps' } as const, null, { shape: 'follow-ups-1' })
+const fill = atom({ plugin: 'session-deck', key: 'fill' } as const, { parts: [], results: [] }, { shape: 'fill-1' })
 const clock = atom({ plugin: 'session-deck', key: 'now' } as const, 0)
 
 const LIMIT_LABELS: Record<string, string> = { five_hour: '5h', seven_day: '7d', spend_limit: 'spend' }
@@ -407,6 +410,30 @@ function agentCounts(list: readonly Agent[]): string {
   return [running > 0 ? `${running} running` : '', finished > 0 ? `${finished} done` : ''].filter(Boolean).join(', ')
 }
 
+async function noteFill($: EngineInterface): Promise<void> {
+  const { context } = await $.session.usage({ breakdown: 'summary' })
+  const parts = (context.breakdown?.categories ?? [])
+    .filter(c => c.kind === 'used')
+    .sort((a, b) => b.tokens - a.tokens)
+    .slice(0, FILL_PARTS)
+    .map(c => ({ name: c.name.toLowerCase(), tokens: c.tokens }))
+
+  await update($, fill, last => ({ ...last, parts }))
+}
+
+/**
+ * @return [String] a tool result's name in the pane: the tool without its MCP prefix, and the
+ *   file it read or wrote
+ */
+function resultName(tool: string, input: Record<string, unknown>): string {
+  const short = tool.split('__').pop() ?? tool
+  const file = typeof input.file_path === 'string' ? input.file_path.split('/').pop() : undefined
+
+  return file === undefined ? short : `${short} ${file}`
+}
+
+const listed = (parts: readonly Part[]) => parts.map(p => `${p.name} ${tokens(p.tokens)}`).join(', ')
+
 async function noteStep($: EngineInterface, e: TurnStepInput): Promise<void> {
   const ran = e.effort === undefined ? { model: e.model } : { model: e.model, effort: e.effort }
   const id = e.agentId
@@ -610,9 +637,16 @@ export const register: Register = (on, options) => {
     const paced = await paceAlerts($, after.limits, at).catch(() => [])
     const lines = [...alerts(before, after, at, settings), ...paced]
     for (const line of lines) $.ui.toast(line, { timeoutMs: 8000 })
+    if (e.changed.includes('context')) await noteFill($).catch(() => undefined)
 
     return next(e)
   })
+
+  on('classic.PostCompact', async ($, e, next) => {
+    await update($, fill, last => ({ ...last, results: [] }))
+
+    return next(e)
+  }).catch(($, e, next) => next(e))
 
   on('prompt.submit', async ($, e, next) => {
     if (e.command !== undefined || e.isMeta) return next(e)
@@ -663,6 +697,16 @@ export const register: Register = (on, options) => {
     }
 
     const ran = await next(e)
+    const size = Math.round((ran.text?.length ?? 0) / 4)
+
+    if (id === undefined && size >= RESULT_MIN_TOKENS) {
+      const result = { name: resultName(e.tool, e as Record<string, unknown>), tokens: size }
+      await update($, fill, last => ({
+        ...last,
+        results: [...last.results, result].sort((x, y) => y.tokens - x.tokens).slice(0, FILL_PARTS),
+      })).catch(() => undefined)
+    }
+
     const met = settings.checks.filter(c => meets(c, e.tool, e as Record<string, unknown>)).map(c => c.label)
 
     if (met.length > 0 && ran.deny === undefined && ran.isError !== true) {
@@ -744,7 +788,7 @@ export const register: Register = (on, options) => {
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const { Box, Text } = $.ui.resolve(e)
-    const [u, r, w, p, m, a, held, f, ticked] = await Promise.all([
+    const [u, r, w, p, m, a, held, f, fl, ticked] = await Promise.all([
       read($, usage),
       read($, routines),
       read($, wakeups),
@@ -753,6 +797,7 @@ export const register: Register = (on, options) => {
       read($, agents),
       read($, checklist),
       read($, followUps),
+      read($, fill),
       read($, clock),
     ])
     const at = ticked || (await $.clock.now())
@@ -829,6 +874,8 @@ export const register: Register = (on, options) => {
             </Box>
           </Box>
         )}
+        {fl.parts.length > 0 && <Text dimColor>{fit(listed(fl.parts), cols)}</Text>}
+        {fl.results.length > 0 && <Text dimColor>{fit(`largest results: ${listed(fl.results)}`, cols)}</Text>}
 
         {section(
           'Limits',

@@ -529,3 +529,82 @@ test(
     await ui.unmount()
   },
 )
+
+const category = (name: string, tokens: number, kind: 'used' | 'free' | 'deferred') => ({
+  name,
+  tokens,
+  kind,
+  color: 'inactive',
+  isDeferred: kind === 'deferred',
+})
+
+test('the context caption names the categories that fill it most', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  mock.store(on)
+  on('ui.toast', () => ({ value: undefined }))
+  on('ui.status', () => ({ value: undefined }))
+  on('session.measure', (_, e) => ({ changed: e.changed }))
+  const asked: unknown[] = []
+  on('session.usage', (_, e) => {
+    asked.push(e)
+    return {
+      value: {
+        startedAt: NOW,
+        context: {
+          window: 1_000_000,
+          tokens: 330_000,
+          percent: 33,
+          breakdown: {
+            categories: [
+              category('System prompt', 3_000, 'used'),
+              category('Messages', 280_000, 'used'),
+              category('MCP tools', 50_000, 'deferred'),
+              category('Memory files', 12_000, 'used'),
+              category('Free space', 600_000, 'free'),
+              category('System tools', 25_000, 'used'),
+            ],
+          },
+        },
+        rateLimits: [],
+      } as never,
+    }
+  })
+
+  await $.session.measure({
+    context: { window: 1_000_000, tokens: 330_000, percent: 33 },
+    rateLimits: [],
+    changed: ['context'],
+  })
+
+  expect(asked).toEqual([{ breakdown: 'summary' }])
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: 'messages 280k, system tools 25k, memory files 12k' })).toBeDefined()
+  await ui.unmount()
+})
+
+test('the largest tool results of the session are named under the context', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  on('tool.call', (_, e) => ({ result: {}, text: 'x'.repeat(e.tool === 'Bash' ? 44_000 : e.tool === 'Read' ? 24_000 : 2_000) }))
+
+  await $.tool.call({ tool: 'Read', file_path: '/work/hooks/register.tsx' })
+  await $.tool.call({ tool: 'Bash', command: 'git log', description: 'Show history' })
+  await $.tool.call({ tool: 'Write', file_path: '/work/small.ts', content: 'x' })
+  await $.tool.call({ tool: 'Read', file_path: '/work/sub/agent.ts', agentId: 'a1' })
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: 'largest results: Bash 11k, Read register.tsx 6k' })).toBeDefined()
+  await ui.unmount()
+})
+
+test('a compaction clears the largest results', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  on('tool.call', () => ({ result: {}, text: 'x'.repeat(44_000) }))
+  on('classic.PostCompact', () => ({}))
+
+  await $.tool.call({ tool: 'Bash', command: 'git log', description: 'Show history' })
+  await $.classic.PostCompact({ trigger: 'auto', compact_summary: 'summary' })
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /largest results/ })).toBeUndefined()
+  await ui.unmount()
+})
