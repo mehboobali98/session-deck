@@ -1,5 +1,7 @@
 # session-deck
 
+[![CI](https://github.com/mehboobali98/session-deck/actions/workflows/ci.yml/badge.svg)](https://github.com/mehboobali98/session-deck/actions/workflows/ci.yml)
+
 A Claude Code mod that keeps a pane beside the chat with the things I kept stopping to check mid-session: which model is answering, how full the context is, how much of my plan's usage limits are left and whether they will last, where I am in the implementation plan, what the subagents are doing, and what is scheduled to run.
 
 ## What it shows
@@ -66,6 +68,8 @@ claude plugin validate .
 claude plugin test .
 claude --plugin-dir .
 ```
+
+CI runs the first two on every push and pull request, on the Claude Code version the mod was last checked against (2.1.310). Bump it in `.github/workflows/ci.yml` after checking a newer release.
 
 ## License
 
