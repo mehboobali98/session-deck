@@ -8,7 +8,7 @@ import type {
   TurnStepInput,
 } from 'claude-code'
 
-import type { Agent, Effort, Limit, Plan, Routine, TaskStatus, Usage } from '../types'
+import type { Agent, Effort, FollowUp, Limit, Plan, Routine, TaskStatus, Usage } from '../types'
 
 const PANE = 'session-deck'
 const TITLE = 'Session'
@@ -24,6 +24,9 @@ const HOUR_MS = 3_600_000
 const WINDOW_MS: Record<string, number> = { five_hour: 5 * HOUR_MS, seven_day: 7 * 24 * HOUR_MS }
 const COSTLY_MODEL = /opus|fable/i
 const ARG_KEYS = ['description', 'pattern', 'file_path', 'command', 'query', 'url'] as const
+const DAY_MS = 24 * HOUR_MS
+const MONTHS = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec']
+const FOLLOW_UP_ROWS = 6
 const ACCENT = 'suggestion'
 const TRACK = 'subtle'
 
@@ -51,6 +54,7 @@ const checklist = atom(
   { ticked: [], isBriefed: false },
   { shape: 'checklist-1' },
 )
+const followUps = atom({ plugin: 'session-deck', key: 'followUps' } as const, null, { shape: 'follow-ups-1' })
 const clock = atom({ plugin: 'session-deck', key: 'now' } as const, 0)
 
 const LIMIT_LABELS: Record<string, string> = { five_hour: '5h', seven_day: '7d', spend_limit: 'spend' }
@@ -66,7 +70,27 @@ type StatusMode = 'full' | 'limits' | 'off'
 
 type Check = { label: string; tool: string; match?: string }
 
-type Settings = { handoffAt: number; warnAt: number; statusLine: StatusMode; checks: Check[] }
+type Source = { path: string; heading: string }
+
+type Settings = {
+  handoffAt: number
+  warnAt: number
+  statusLine: StatusMode
+  checks: Check[]
+  followUps?: Source
+}
+
+/**
+ * @return [Source, undefined] the file and heading of a `path#Heading` setting, or undefined
+ *   when it names no both
+ */
+function sourceFrom(text: unknown): Source | undefined {
+  const [path, ...heading] = String(text ?? '').split('#')
+
+  return path?.trim() && heading.join('#').trim()
+    ? { path: path.trim(), heading: heading.join('#').trim() }
+    : undefined
+}
 
 /**
  * @return [Array<Check>] the items of a `Label=Tool` or `Label=Tool:path part` list split on
@@ -92,7 +116,15 @@ function settingsFrom(options: PluginOptions): Settings {
   const handoffAt = Math.min(95, Math.max(10, Math.round(Number(options.handoffAt) || 50)))
   const statusLine = options.statusLine === 'limits' || options.statusLine === 'off' ? options.statusLine : 'full'
 
-  return { handoffAt, warnAt: handoffAt - 10, statusLine, checks: checksFrom(options.checklist) }
+  const followUpsSource = sourceFrom(options.followUps)
+
+  return {
+    handoffAt,
+    warnAt: handoffAt - 10,
+    statusLine,
+    checks: checksFrom(options.checklist),
+    ...(followUpsSource === undefined ? {} : { followUps: followUpsSource }),
+  }
 }
 
 const toUsage = (context: SessionContextUsage, limits: readonly SessionRateLimit[]): Usage => ({
@@ -126,6 +158,91 @@ const reachedHandoff = (before: Usage | null, after: Usage, { warnAt, handoffAt 
 const handoffNote = (percent: number | undefined, handoffAt: number) =>
   `session-deck: context is at ${percent ?? handoffAt}%, past the ${handoffAt}% handoff mark. ` +
   'Tell the person, finish the step in hand, then prepare the handoff before starting anything new.'
+
+const plain = (line: string) =>
+  line
+    .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')
+    .replace(/[*_`]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+
+function dayOf(day: number, month: string, at: number): string | undefined {
+  const index = MONTHS.indexOf(month.toLowerCase())
+  if (index < 0 || day < 1 || day > 31) return undefined
+
+  const year = new Date(at).getUTCFullYear()
+  const [nearest] = [year - 1, year, year + 1]
+    .map(y => Date.UTC(y, index, day))
+    .sort((a, b) => Math.abs(a - at) - Math.abs(b - at))
+
+  return nearest === undefined ? undefined : new Date(nearest).toISOString().slice(0, 10)
+}
+
+/**
+ * @return [String, undefined] the first date a line names (`26 Oct`, `Oct 26`, `2026-10-26`) as
+ *   `YYYY-MM-DD`, a date without a year taken in the year that puts it nearest `at`
+ */
+function dueDate(text: string, at: number): string | undefined {
+  const found = [
+    ...[...text.matchAll(/(?<![\w/-])(\d{4})-(\d{2})-(\d{2})(?![\w-])/g)].map(m => ({ index: m.index, iso: `${m[1]}-${m[2]}-${m[3]}` })),
+    ...[...text.matchAll(/\b(\d{1,2})\s+([a-z]{3})[a-z]*\b/gi)].map(m => ({ index: m.index, iso: dayOf(Number(m[1]), m[2] ?? '', at) })),
+    ...[...text.matchAll(/\b([a-z]{3})[a-z]*\s+(\d{1,2})\b/gi)].map(m => ({ index: m.index, iso: dayOf(Number(m[2]), m[1] ?? '', at) })),
+  ]
+
+  return found.filter(f => f.iso !== undefined).sort((a, b) => a.index - b.index)[0]?.iso
+}
+
+/**
+ * @return [Array<FollowUp>, undefined] the top-level bullets under `heading`, or undefined when
+ *   the file has no such heading
+ */
+function followUpItems(text: string, heading: string, at: number): FollowUp[] | undefined {
+  const lines = text.split('\n')
+  const start = lines.findIndex(l => /^#{1,6}\s/.test(l) && plain(l.replace(/^#+/, '')).toLowerCase() === heading.toLowerCase())
+  if (start < 0) return undefined
+
+  const level = /^#+/.exec(lines[start] ?? '')?.[0].length ?? 1
+  const items: FollowUp[] = []
+
+  for (const line of lines.slice(start + 1)) {
+    const next = /^(#{1,6})\s/.exec(line)
+    if (next !== null && (next[1]?.length ?? 0) <= level) break
+
+    const bullet = /^[-*+]\s+(.*)$/.exec(line)?.[1]
+    if (bullet === undefined) continue
+
+    const item = plain(bullet)
+    const due = dueDate(item, at)
+    items.push(due === undefined ? { text: item } : { text: item, due })
+  }
+
+  return items
+}
+
+function dueIn(due: string, at: number): { label: string; isDue: boolean } {
+  const days = Math.round((Date.parse(due) - Date.parse(new Date(at).toISOString().slice(0, 10))) / DAY_MS)
+
+  if (days < -1) return { label: `${-days}d late`, isDue: true }
+  if (days === -1) return { label: 'yesterday', isDue: true }
+  if (days === 0) return { label: 'today', isDue: true }
+
+  return { label: days === 1 ? 'tomorrow' : `in ${days}d`, isDue: false }
+}
+
+async function refreshFollowUps($: EngineInterface, source: Source | undefined): Promise<void> {
+  if (source === undefined) return
+
+  const path = source.path.startsWith('~/') ? `${(await $.env.get('HOME')) ?? ''}${source.path.slice(1)}` : source.path
+  const at = await $.clock.now()
+  const text = await $.fs.read(path).catch(() => undefined)
+  const items = text === undefined ? undefined : followUpItems(text, source.heading, at)
+
+  await update($, followUps, () =>
+    items !== undefined
+      ? { items }
+      : { items: [], error: text === undefined ? `Can't read ${source.path}` : `No "${source.heading}" heading in ${source.path}` },
+  )
+}
 
 const meets = ({ tool, match }: Check, called: string, input: Record<string, unknown>) =>
   tool === called && (match === undefined || Object.values(input).some(v => typeof v === 'string' && v.includes(match)))
@@ -422,12 +539,13 @@ async function tick($: EngineInterface): Promise<void> {
   await update($, clock, () => at)
 }
 
-async function seed($: EngineInterface, mode: StatusMode): Promise<void> {
+async function seed($: EngineInterface, settings: Settings): Promise<void> {
   const { context, rateLimits } = await $.session.usage()
   const seeded = toUsage(context, rateLimits)
   await update($, usage, () => seeded)
-  $.ui.status(statusText(seeded, mode))
+  $.ui.status(statusText(seeded, settings.statusLine))
   await tick($)
+  await refreshFollowUps($, settings.followUps).catch(() => undefined)
 }
 
 export const register: Register = (on, options) => {
@@ -452,7 +570,7 @@ export const register: Register = (on, options) => {
       isDeferred: false,
     })
 
-    await seed($, settings.statusLine)
+    await seed($, settings)
 
     if (e.isInteractive) {
       $.clock.every(60_000, () => void tick($))
@@ -466,7 +584,7 @@ export const register: Register = (on, options) => {
 
   on('classic.SessionStart', async ($, e, next) => {
     if (e.source === 'clear') {
-      await seed($, settings.statusLine)
+      await seed($, settings)
       $.clock.after(0, () => void refreshRoutines($))
     }
 
@@ -557,6 +675,7 @@ export const register: Register = (on, options) => {
   }).catch(($, e, next) => next(e))
 
   on('classic.Stop', async ($, e, next) => {
+    await refreshFollowUps($, settings.followUps).catch(() => undefined)
     await update($, wakeups, () => ({
       crons: (e.session_crons ?? []).map(c => ({
         id: c.id,
@@ -625,7 +744,7 @@ export const register: Register = (on, options) => {
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const { Box, Text } = $.ui.resolve(e)
-    const [u, r, w, p, m, a, held, ticked] = await Promise.all([
+    const [u, r, w, p, m, a, held, f, ticked] = await Promise.all([
       read($, usage),
       read($, routines),
       read($, wakeups),
@@ -633,6 +752,7 @@ export const register: Register = (on, options) => {
       read($, model),
       read($, agents),
       read($, checklist),
+      read($, followUps),
       read($, clock),
     ])
     const at = ticked || (await $.clock.now())
@@ -657,6 +777,17 @@ export const register: Register = (on, options) => {
     const scheduled = w.crons.length + w.jobs.length
     const checksDone = settings.checks.filter(c => held.ticked.includes(c.label)).length
     const isChecked = checksDone === settings.checks.length
+    const owed = (f?.items ?? [])
+      .map((item, order) => ({ item, order, when: item.due === undefined ? undefined : dueIn(item.due, at) }))
+      .sort(
+        (x, y) =>
+          Number(y.when?.isDue ?? false) - Number(x.when?.isDue ?? false) ||
+          (x.item.due ?? '9999').localeCompare(y.item.due ?? '9999') ||
+          x.order - y.order,
+      )
+    const dueCount = owed.filter(o => o.when?.isDue).length
+    const followUpsValue =
+      f === null ? 'checking' : f.error !== undefined ? 'unreadable' : dueCount > 0 ? `${dueCount} due` : owed.length === 0 ? 'none' : `${owed.length} open`
 
     const done = p?.tasks.filter(t => t.status === 'done').length ?? 0
     const firstOpen = Math.max(0, p?.tasks.findIndex(t => t.status !== 'done') ?? 0)
@@ -740,6 +871,27 @@ export const register: Register = (on, options) => {
             ))}
             {planRest > 0 && <Text dimColor>  … {planRest} more</Text>}
           </Box>
+        )}
+
+        {settings.followUps !== undefined &&
+          section('Follow-ups', followUpsValue, dueCount > 0 ? 'warning' : f?.error !== undefined ? 'error' : undefined)}
+        {settings.followUps !== undefined && f?.error !== undefined && <Text color="warning">{fit(f.error, cols)}</Text>}
+        {settings.followUps !== undefined &&
+          owed.slice(0, FOLLOW_UP_ROWS).map(({ item, when }) => (
+            <Box justifyContent="space-between">
+              <Text dimColor={!when?.isDue}>
+                <Text color={when?.isDue ? 'warning' : undefined}>{when?.isDue ? '●' : '·'}</Text>{' '}
+                {fit(item.text, Math.max(8, cols - (when?.label.length ?? 0) - 4))}
+              </Text>
+              {when !== undefined && (
+                <Text color={when.isDue ? 'warning' : undefined} dimColor={!when.isDue}>
+                  {when.label}
+                </Text>
+              )}
+            </Box>
+          ))}
+        {settings.followUps !== undefined && owed.length > FOLLOW_UP_ROWS && (
+          <Text dimColor>  … {owed.length - FOLLOW_UP_ROWS} more</Text>
         )}
 
         {section('Agents', a.length === 0 ? 'none' : agentCounts(a))}

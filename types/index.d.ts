@@ -44,6 +44,10 @@ export type Nudge = 'due' | 'sent'
 
 export type Checklist = { ticked: string[]; isBriefed: boolean }
 
+export type FollowUp = { text: string; due?: string }
+
+export type FollowUps = { items: FollowUp[]; error?: string }
+
 declare module 'claude-code' {
   interface PluginState {
     'session-deck': {
@@ -55,6 +59,7 @@ declare module 'claude-code' {
       agents: Shaped<Agent[]>
       nudge: Shaped<Nudge | null>
       checklist: Shaped<Checklist>
+      followUps: Shaped<FollowUps | null>
       now: number
     }
   }
