@@ -1,3 +1,4 @@
+import type { SessionMeasureInput } from 'claude-code'
 import { expect, mock, test } from 'claude-code/testing'
 
 const NOW = Date.parse('2026-10-25T12:00:00Z')
@@ -152,3 +153,41 @@ test('crons and wakeups from the end of a turn are listed', async ($, on) => {
   expect((await ui.find({ type: 'Text', text: /npm test/ }))?.text).toContain('shell running')
   await ui.unmount()
 })
+
+const MEASURE: SessionMeasureInput = {
+  context: { window: 1_000_000, tokens: 620_000, percent: 62 },
+  rateLimits: [{ kind: 'five_hour', percentUsed: 30 }],
+  changed: ['context', 'rateLimits'],
+}
+
+test('the handoff mark comes from the settings', { options: { handoffAt: 70 } }, async ($, on) => {
+  mock.clock(on, { now: NOW })
+  const toasts: string[] = []
+  on('ui.toast', (_, e) => (toasts.push(e.text), { value: undefined }))
+  on('ui.status', () => ({ value: undefined }))
+  on('session.measure', (_, e) => ({ changed: e.changed }))
+
+  await $.session.measure(MEASURE)
+
+  expect(toasts).toEqual(['Context at 62%: aim for a clean stopping point by 70%'])
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /handoff at 70%/ })).toBeDefined()
+  await ui.unmount()
+})
+
+for (const [statusLine, expected] of [
+  ['limits', '5h 30%'],
+  ['off', undefined],
+] as const) {
+  test(`the status line setting ${statusLine} shows ${expected ?? 'nothing'}`, { options: { statusLine } }, async ($, on) => {
+    mock.clock(on, { now: NOW })
+    const lines: (string | undefined)[] = []
+    on('ui.toast', () => ({ value: undefined }))
+    on('ui.status', (_, e) => (lines.push(e.text), { value: undefined }))
+    on('session.measure', (_, e) => ({ changed: e.changed }))
+
+    await $.session.measure(MEASURE)
+
+    expect(lines).toEqual([expected])
+  })
+}
