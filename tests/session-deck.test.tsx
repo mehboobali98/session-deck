@@ -103,7 +103,7 @@ test('context and limits show as bars, with a toast past the handoff mark', asyn
     const ticks = await ui.findAll({ type: 'Text', text: '┃' })
     expect(ticks.some(tick => tick.props.color === 'warning')).toBe(true)
     expect((await ui.find({ type: 'Text', text: /^5h/ }))?.text).toContain('82%')
-    expect(await ui.find({ type: 'Text', text: '5h 82%' })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: '↻ 2h 30m' })).toBeDefined()
     await ui.unmount()
   }
 })
@@ -274,9 +274,9 @@ test('a limit on pace to run out before its reset says when, with one toast per 
     '7d limit runs out in ~12h 0m at this pace, 3d 16h before reset',
   ])
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  expect((await ui.find({ type: 'Text', text: /at this pace/ }))?.text).toContain('before reset')
-  const trail = await ui.findAll({ type: 'Text', text: /┅/ })
-  expect(trail.some(dash => dash.props.color === 'error')).toBe(true)
+  expect((await ui.find({ type: 'Text', text: /before reset/ }))?.text).toContain('out in ~11h 4m, 3d 16h before reset')
+  const trail = await ui.findAll({ type: 'Text', text: /░/ })
+  expect(trail.some(hatch => hatch.props.color === 'error')).toBe(true)
   await ui.unmount()
 })
 
@@ -326,7 +326,8 @@ test('no forecast early in a window or for a limit that lasts to its reset', asy
 
   expect(toasts.filter(t => t.includes('at this pace'))).toEqual([])
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  expect(await ui.find({ type: 'Text', text: /at this pace/ })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: /before reset/ })).toBeUndefined()
+  expect(await ui.findAll({ type: 'Text', text: /░/ })).toEqual([])
   await ui.unmount()
 })
 
@@ -577,9 +578,12 @@ test('the context caption names the categories that fill it most', async ($, on)
   })
 
   expect(asked).toEqual([{ breakdown: 'summary' }])
-  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  expect(await ui.find({ type: 'Text', text: 'messages 280k, system tools 25k, memory files 12k' })).toBeDefined()
-  await ui.unmount()
+  const wide = await $.ui.mount({ ...PANE, props: { ...PANE.props, bodyColumns: 72 }, surface: 'terminal' })
+  expect(await wide.find({ type: 'Text', text: 'messages 280k · system tools 25k · memory files 12k' })).toBeDefined()
+  await wide.unmount()
+  const narrow = await $.ui.mount({ ...PANE, props: { ...PANE.props, bodyColumns: 48 }, surface: 'terminal' })
+  expect(await narrow.find({ type: 'Text', text: 'messages 280k · system tools 25k' })).toBeDefined()
+  await narrow.unmount()
 })
 
 test('the largest tool results of the session are named under the context', async ($, on) => {
@@ -592,7 +596,7 @@ test('the largest tool results of the session are named under the context', asyn
   await $.tool.call({ tool: 'Read', file_path: '/work/sub/agent.ts', agentId: 'a1' })
 
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  expect(await ui.find({ type: 'Text', text: 'largest results: Bash 11k, Read register.tsx 6k' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: 'largest results: Bash 11k · Read register.tsx 6k' })).toBeDefined()
   await ui.unmount()
 })
 
@@ -634,7 +638,7 @@ test("the repo section shows the branch, what changed and the PR's checks", asyn
 
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   expect(await ui.find({ type: 'Text', text: 'repo-line' })).toBeDefined()
-  expect(await ui.find({ type: 'Text', text: '2 changed, 1 ahead' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: '2 changed · 1 ahead' })).toBeDefined()
   const pr = await ui.find({ type: 'Text', text: 'PR #8 open, checks failing' })
   expect(pr?.props.color).toBe('error')
   await ui.unmount()
@@ -658,7 +662,7 @@ test('the PR is asked for at most every two minutes', async ($, on) => {
   expect(asked).toEqual(['git', 'gh', 'git'])
 })
 
-test('outside a git repository there is no repo section', async ($, on) => {
+test('outside a git repository the header has no repo line', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
   on('classic.Stop', () => ({}))
   on('process.run', () => ran('', 128))
@@ -667,6 +671,78 @@ test('outside a git repository there is no repo section', async ($, on) => {
   await clock.settle()
 
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  expect(await ui.find({ type: 'Text', text: /^Repo/ })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: 'clean' })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: /changed|ahead|PR #/ })).toBeUndefined()
+  await ui.unmount()
+})
+
+const reply = async ($: Engine, percent: number) => {
+  await $.session.measure({ context: { window: 1_000_000, tokens: percent * 10_000, percent }, rateLimits: [], changed: ['context'] })
+  await $.classic.Stop({ stop_hook_active: false })
+}
+
+const quietMeasure = (on: On) => {
+  on('ui.toast', () => ({ value: undefined }))
+  on('ui.status', () => ({ value: undefined }))
+  on('session.measure', (_, e) => ({ changed: e.changed }))
+  on('session.usage', () => ({ value: { startedAt: NOW, context: { window: 1_000_000, tokens: 0, percent: 0 }, rateLimits: [] } }))
+  on('classic.Stop', () => ({}))
+  on('classic.PostCompact', () => ({}))
+}
+
+test('replies draw the context across the session, with the handoff line and compactions', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  mock.store(on)
+  quietMeasure(on)
+
+  for (const percent of [10, 30, 55]) await reply($, percent)
+  await $.classic.PostCompact({ trigger: 'auto', compact_summary: 'summary' })
+  await reply($, 15)
+
+  for (const surface of SURFACES) {
+    const ui = await $.ui.mount({ ...PANE, surface })
+    expect(await ui.find({ type: 'Text', text: '4 replies · 1 compaction' })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /╌ ╌.*50%$/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /^start +now$/ })).toBeDefined()
+    const columns = await ui.findAll({ type: 'Text', text: /^[▁▂▃▄▅▆▇█]+$/ })
+    expect(columns.some(column => String(column.props.color).startsWith('#'))).toBe(true)
+    await ui.unmount()
+  }
+})
+
+test('one reply draws no chart yet, and /clear starts it over', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  mock.store(on)
+  quietMeasure(on)
+  on('classic.SessionStart', () => ({}))
+  on('tool.call', () => ({ result: {}, text: ROUTINES }))
+  on('process.run', () => ran('', 128))
+
+  await reply($, 10)
+  const first = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await first.find({ type: 'Text', text: /^This session/ })).toBeUndefined()
+  await first.unmount()
+
+  await reply($, 20)
+  await $.classic.SessionStart({ source: 'clear' })
+  const cleared = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await cleared.find({ type: 'Text', text: /^This session/ })).toBeUndefined()
+  await cleared.unmount()
+})
+
+test('a meter warms from green toward amber along its length', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  mock.store(on)
+  quietMeasure(on)
+
+  await $.session.measure({ context: { window: 1_000_000, tokens: 450_000, percent: 45 }, rateLimits: [], changed: ['context'] })
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const row = await ui.find({ type: 'Text', text: /^Context/ })
+  const fills = await ui.findAll({ type: 'Text', text: /^[█▏▎▍▌▋▊▉]+$/ })
+  const colors = new Set(fills.map(cell => String(cell.props.color)).filter(color => color.startsWith('#')))
+  expect(row?.text).toContain('45%')
+  expect(colors.size).toBeGreaterThan(5)
+  expect(colors.has('#40ba50')).toBe(true)
   await ui.unmount()
 })

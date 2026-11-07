@@ -8,7 +8,7 @@ import type {
   TurnStepInput,
 } from 'claude-code'
 
-import type { Agent, Checks, Effort, FollowUp, Limit, Part, Plan, PullRequest, Repo, Routine, TaskStatus, Usage } from '../types'
+import type { Agent, Checks, Effort, FollowUp, History, Limit, Part, Plan, PullRequest, Repo, Routine, TaskStatus, Usage } from '../types'
 
 const PANE = 'session-deck'
 const TITLE = 'Session'
@@ -33,6 +33,20 @@ const PR_REFRESH_MS = 2 * 60_000
 const FAILED_CHECKS = ['FAILURE', 'ERROR', 'TIMED_OUT', 'CANCELLED', 'ACTION_REQUIRED', 'STARTUP_FAILURE']
 const ACCENT = 'suggestion'
 const TRACK = 'subtle'
+const TRAIL = '░'
+const LABEL_WIDTH = 8
+const PERCENT_WIDTH = 5
+const EIGHTHS = ['', '▏', '▎', '▍', '▌', '▋', '▊', '▉', '█']
+const RISING = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█']
+const GREEN = [128, 0.49, 0.49]
+const AMBER = [42, 0.74, 0.57]
+const ORANGE = [25, 0.86, 0.59]
+const RED = [3, 0.93, 0.63]
+const HANDOFF_LINE = '#9a7b35'
+const CHART_ROWS = 6
+const CHART_LABEL_WIDTH = 5
+const HISTORY_KEPT = 240
+const CLIFF = 10
 
 const PLAN_TOOL_DESCRIPTION =
   "Marks a task of the implementation plan in the person's session deck pane as todo, doing or done. " +
@@ -61,6 +75,8 @@ const checklist = atom(
 const followUps = atom({ plugin: 'session-deck', key: 'followUps' } as const, null, { shape: 'follow-ups-1' })
 const repo = atom({ plugin: 'session-deck', key: 'repo' } as const, null, { shape: 'repo-1' })
 const fill = atom({ plugin: 'session-deck', key: 'fill' } as const, { parts: [], results: [] }, { shape: 'fill-1' })
+const EMPTY_HISTORY: History = { points: [], turns: 0, compactions: 0 }
+const history = atom({ plugin: 'session-deck', key: 'history' } as const, EMPTY_HISTORY, { shape: 'history-1' })
 const clock = atom({ plugin: 'session-deck', key: 'now' } as const, 0)
 
 const LIMIT_LABELS: Record<string, string> = { five_hour: '5h', seven_day: '7d', spend_limit: 'spend' }
@@ -324,11 +340,14 @@ function relative(iso: string, at: number): string {
   return ms >= 0 ? `in ${span(ms)}` : `${span(-ms)} ago`
 }
 
+type Forecast = { outIn: number; early: number }
+
 /**
- * @return [String, undefined] when the limit runs out at its pace since the window opened, or
- *   undefined when it lasts to its reset or the window is too young to tell
+ * @return [Forecast, undefined] how long until the limit runs out at its pace since the window
+ *   opened and how long before its reset that is, or undefined when it lasts to its reset or the
+ *   window is too young to tell
  */
-function pace(limit: Limit, at: number): string | undefined {
+function forecast(limit: Limit, at: number): Forecast | undefined {
   const length = WINDOW_MS[limit.kind]
   const resetsAt = Date.parse(limit.resetsAt ?? '')
   const used = limit.percentUsed
@@ -339,9 +358,15 @@ function pace(limit: Limit, at: number): string | undefined {
 
   const outAt = at + ((100 - used) / used) * elapsed
 
-  return outAt < resetsAt
-    ? `runs out in ~${span(outAt - at)} at this pace, ${span(resetsAt - outAt)} before reset`
-    : undefined
+  return outAt < resetsAt ? { outIn: outAt - at, early: resetsAt - outAt } : undefined
+}
+
+function pace(limit: Limit, at: number): string | undefined {
+  const ahead = forecast(limit, at)
+
+  return ahead === undefined
+    ? undefined
+    : `runs out in ~${span(ahead.outIn)} at this pace, ${span(ahead.early)} before reset`
 }
 
 /**
@@ -435,7 +460,19 @@ function resultName(tool: string, input: Record<string, unknown>): string {
   return file === undefined ? short : `${short} ${file}`
 }
 
-const listed = (parts: readonly Part[]) => parts.map(p => `${p.name} ${tokens(p.tokens)}`).join(', ')
+/**
+ * @return [String] as many whole `name size` parts as fit in `width` after `prefix`, joined by
+ *   middle dots, or the first part cut to fit when not even one does
+ */
+function listed(parts: readonly Part[], width: number, prefix = ''): string {
+  const names = parts.map(p => `${p.name} ${tokens(p.tokens)}`)
+  const kept = names.reduce<string[]>(
+    (out, name) => (`${prefix}${[...out, name].join(' · ')}`.length <= width ? [...out, name] : out),
+    [],
+  )
+
+  return kept.length > 0 ? `${prefix}${kept.join(' · ')}` : fit(`${prefix}${names[0] ?? ''}`, width)
+}
 
 /**
  * @return [Repo, undefined] the branch, changed files and distance from upstream in
@@ -521,25 +558,145 @@ async function noteStep($: EngineInterface, e: TurnStepInput): Promise<void> {
 const fit = (text: string, width: number) =>
   text.length > width ? `${text.slice(0, Math.max(1, width - 1))}…` : text
 
-type Run = { glyph: string; color: string }
+type Run = { glyph: string; color: string; background?: string }
+
+type Scale = { warnAt: number; alarmAt: number }
 
 /**
- * @return [Array<Run>] a gauge `width` cells long, `percent` of it filled in `color` on a grey
- *   track, with a warning tick at `tick` percent and, with `trail`, red dashes past the fill
+ * @return [String] the `#rrggbb` of a hue in degrees with saturation and lightness from 0 to 1
  */
-function gauge(width: number, percent: number, color: string, { tick, trail }: { tick?: number; trail?: boolean } = {}): Run[] {
-  const filled = Math.round((Math.min(100, Math.max(0, percent)) / 100) * width)
-  const cells = Array.from({ length: width }, (_, i): Run =>
-    i < filled ? { glyph: '━', color } : trail ? { glyph: '┅', color: 'error' } : { glyph: '━', color: TRACK },
-  )
-  if (tick !== undefined) cells[Math.min(width - 1, Math.round((tick / 100) * width))] = { glyph: '┃', color: 'warning' }
+function hex([hue = 0, saturation = 0, lightness = 0]: readonly number[]): string {
+  const chroma = (1 - Math.abs(2 * lightness - 1)) * saturation
+  const channel = (n: number) => {
+    const k = (n + hue / 30) % 12
+    const value = lightness - chroma / 2 * Math.max(-1, Math.min(k - 3, 9 - k, 1))
 
-  return cells.reduce<Run[]>((runs, cell) => {
+    return Math.round(value * 255).toString(16).padStart(2, '0')
+  }
+
+  return `#${channel(0)}${channel(8)}${channel(4)}`
+}
+
+/**
+ * @return [String] the colour at `percent` on a scale that stays green to a third of the way to
+ *   the warning mark, warms through yellow to amber at it, orange at the alarm mark and red at
+ *   100, blended by hue so the colours in between stay as vivid as the stops
+ */
+function heat(percent: number, { warnAt, alarmAt }: Scale): string {
+  const stops: [number, readonly number[]][] = [[0, GREEN], [warnAt / 3, GREEN], [warnAt, AMBER], [alarmAt, ORANGE], [100, RED]]
+  const at = Math.min(100, Math.max(0, Math.round(percent / 2) * 2))
+  const upper = stops.findIndex(([mark]) => at <= mark)
+  const [from, low] = stops[Math.max(0, upper - 1)] ?? stops[0]!
+  const [to, high] = stops[Math.max(0, upper)] ?? stops[stops.length - 1]!
+  const k = to === from ? 1 : (at - from) / (to - from)
+
+  return hex(low.map((v, i) => v + ((high[i] ?? v) - v) * k))
+}
+
+const tone = (percent: number, { warnAt, alarmAt }: Scale) =>
+  percent >= alarmAt ? 'error' : percent >= warnAt ? 'warning' : 'success'
+
+const merged = (cells: readonly Run[]) =>
+  cells.reduce<Run[]>((runs, cell) => {
     const last = runs.at(-1)
-    if (last?.color === cell.color && last.glyph.at(-1) === cell.glyph) last.glyph += cell.glyph
+    if (last !== undefined && last.color === cell.color && last.background === cell.background) last.glyph += cell.glyph
     else runs.push({ ...cell })
     return runs
   }, [])
+
+/**
+ * @return [Array<Run>] a gauge `width` cells long, filled to `percent` to an eighth of a cell, each
+ *   cell coloured by where it sits on `scale`, on a grey track, with a warning tick at `tick`
+ *   percent and, with `trail`, red hatching past the fill
+ */
+function gauge(width: number, percent: number, scale: Scale, { tick, trail }: { tick?: number; trail?: boolean } = {}): Run[] {
+  const exact = (Math.min(100, Math.max(0, percent)) / 100) * width
+  const cells = Array.from({ length: width }, (_, i): Run => {
+    const color = heat(((i + 0.5) / width) * 100, scale)
+    const part = EIGHTHS[Math.round(Math.min(1, Math.max(0, exact - i)) * 8)] ?? ''
+
+    if (part === '█') return { glyph: part, color }
+    if (part !== '') return { glyph: part, color, background: TRACK }
+
+    return trail ? { glyph: TRAIL, color: 'error' } : { glyph: '█', color: TRACK }
+  })
+
+  if (tick !== undefined) {
+    const at = Math.min(width - 1, Math.round((tick / 100) * width))
+    const under = cells[at]
+    cells[at] = { glyph: '┃', color: 'warning', background: under?.glyph === '█' ? under.color : TRACK }
+  }
+
+  return merged(cells)
+}
+
+/**
+ * @return [Array<Number>] `points` stretched or squeezed to `width` columns: squeezed by the
+ *   highest in each column, stretched by straight lines except across a drop of more than
+ *   CLIFF points, which stays a cliff
+ */
+function columns(points: readonly number[], width: number): number[] {
+  if (points.length === 0) return []
+  if (points.length >= width) {
+    return Array.from({ length: width }, (_, c) => {
+      const start = Math.floor((c * points.length) / width)
+      const end = Math.max(start + 1, Math.floor(((c + 1) * points.length) / width))
+
+      return Math.max(...points.slice(start, end))
+    })
+  }
+
+  return Array.from({ length: width }, (_, c) => {
+    const x = width === 1 ? 0 : (c / (width - 1)) * (points.length - 1)
+    const i = Math.floor(x)
+    const from = points[i] ?? 0
+    const to = points[Math.min(points.length - 1, i + 1)] ?? from
+
+    return to < from - CLIFF ? (x - i < 0.5 ? from : to) : from + (to - from) * (x - i)
+  })
+}
+
+/**
+ * @return [Hash] `lines`, an area chart `rows` tall of `points` (percents) across `width`
+ *   columns, each row coloured by the height it stands for, with the handoff mark dashed across
+ *   the empty cells of `handoffRow`
+ */
+function chart(points: readonly number[], width: number, rows: number, handoffAt: number, scale: Scale) {
+  const values = columns(points, width)
+  const top = Math.min(100, Math.max(handoffAt + 10, ...values.map(v => v + 10)))
+  const handoffRow = Math.min(rows - 1, Math.max(0, rows - Math.ceil((handoffAt / top) * rows)))
+
+  const lines = Array.from({ length: rows }, (_, r) => {
+    const high = ((rows - r) / rows) * top
+    const low = ((rows - r - 1) / rows) * top
+    const color = heat((low + high) / 2, scale)
+    const isHandoffRow = r === handoffRow
+
+    return merged(
+      values.map((v, c): Run => {
+        if (v >= high) return { glyph: '█', color }
+        if (v > low) return { glyph: RISING[Math.max(0, Math.round(((v - low) / (high - low)) * 8) - 1)] ?? '▁', color }
+
+        return isHandoffRow ? { glyph: c % 2 === 0 ? '╌' : ' ', color: HANDOFF_LINE } : { glyph: ' ', color: TRACK }
+      }),
+    )
+  })
+
+  return { lines, handoffRow }
+}
+
+/**
+ * @return [History] `last` with a reply's context percent added, halved by pairs (keeping the
+ *   higher of each) once it holds more than HISTORY_KEPT
+ */
+function withPoint(last: History, percent: number): History {
+  const points = [...last.points, percent]
+  const kept =
+    points.length > HISTORY_KEPT
+      ? Array.from({ length: Math.ceil(points.length / 2) }, (_, i) => Math.max(points[2 * i] ?? 0, points[2 * i + 1] ?? 0))
+      : points
+
+  return { ...last, points: kept, turns: last.turns + 1 }
 }
 
 function tokens(n: number): string {
@@ -547,9 +704,6 @@ function tokens(n: number): string {
 
   return n >= 1_000 ? `${Math.round(n / 1_000)}k` : String(n)
 }
-
-const tone = (percent: number, warnAt: number, alarmAt: number) =>
-  percent >= alarmAt ? 'error' : percent >= warnAt ? 'warning' : 'success'
 
 type RawRoutine = {
   id?: string
@@ -683,6 +837,7 @@ export const register: Register = (on, options) => {
 
   on('classic.SessionStart', async ($, e, next) => {
     if (e.source === 'clear') {
+      await update($, history, () => EMPTY_HISTORY)
       await seed($, settings)
       $.clock.after(0, () => void refreshRoutines($))
       laterRefreshRepo($)
@@ -717,6 +872,7 @@ export const register: Register = (on, options) => {
 
   on('classic.PostCompact', async ($, e, next) => {
     await update($, fill, last => ({ ...last, results: [] }))
+    await update($, history, last => ({ ...last, compactions: last.compactions + 1 }))
 
     return next(e)
   }).catch(($, e, next) => next(e))
@@ -792,6 +948,8 @@ export const register: Register = (on, options) => {
   }).catch(($, e, next) => next(e))
 
   on('classic.Stop', async ($, e, next) => {
+    const percent = (await read($, usage))?.percent
+    if (percent !== undefined) await update($, history, last => withPoint(last, percent))
     await refreshFollowUps($, settings.followUps).catch(() => undefined)
     laterRefreshRepo($)
     await update($, wakeups, () => ({
@@ -862,7 +1020,7 @@ export const register: Register = (on, options) => {
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const { Box, Text } = $.ui.resolve(e)
-    const [u, r, w, p, m, a, held, f, fl, g, ticked] = await Promise.all([
+    const [u, r, w, p, m, a, held, f, fl, g, past, ticked] = await Promise.all([
       read($, usage),
       read($, routines),
       read($, wakeups),
@@ -873,10 +1031,16 @@ export const register: Register = (on, options) => {
       read($, followUps),
       read($, fill),
       read($, repo),
+      read($, history),
       read($, clock),
     ])
     const at = ticked || (await $.clock.now())
     const cols = e.props.bodyColumns
+    const meterWidth = Math.max(6, cols - LABEL_WIDTH - PERCENT_WIDTH)
+    const captionWidth = Math.max(8, cols - LABEL_WIDTH)
+    const chartWidth = Math.max(8, cols - CHART_LABEL_WIDTH)
+    const contextScale: Scale = { warnAt: settings.warnAt, alarmAt: settings.handoffAt }
+    const limitScale: Scale = { warnAt: LIMIT_WARN_AT, alarmAt: LIMIT_ALARM_AT }
 
     const section = (name: string, value: string, color?: string) => (
       <Box marginTop={1} justifyContent="space-between">
@@ -887,12 +1051,37 @@ export const register: Register = (on, options) => {
       </Box>
     )
 
-    const drawn = (runs: Run[]) => runs.map(run => <Text color={run.color}>{run.glyph}</Text>)
+    const drawn = (runs: Run[]) =>
+      runs.map(run => (
+        <Text color={run.color} backgroundColor={run.background}>
+          {run.glyph}
+        </Text>
+      ))
 
-    const contextTone = u?.percent === undefined ? undefined : tone(u.percent, settings.warnAt, settings.handoffAt)
-    const worst = [...(u?.limits ?? [])].sort((x, y) => y.percentUsed - x.percentUsed)[0]
-    const resets = (u?.limits ?? []).map(l => (l.resetsAt === undefined ? '' : `↻ ${relative(l.resetsAt, at).replace(/^in /, '')}`))
-    const resetWidth = Math.max(0, ...resets.map(reset => reset.length))
+    const meter = (name: string, percent: number, scale: Scale, marks: { tick?: number; trail?: boolean } = {}) => (
+      <Text>
+        <Text weight="bold">{name.padEnd(LABEL_WIDTH)}</Text>
+        {drawn(gauge(meterWidth, percent, scale, marks))}
+        <Text color={tone(percent, scale)} weight="bold">
+          {`${Math.round(percent)}%`.padStart(PERCENT_WIDTH)}
+        </Text>
+      </Text>
+    )
+
+    const caption = (left: string, right?: string, color?: string) => (
+      <Box justifyContent="space-between">
+        <Text>
+          {' '.repeat(LABEL_WIDTH)}
+          <Text color={color} dimColor={color === undefined}>
+            {left}
+          </Text>
+        </Text>
+        {right !== undefined && right !== '' && <Text dimColor>{right}</Text>}
+      </Box>
+    )
+
+    const limits = u?.limits ?? []
+    const resets = limits.map(l => (l.resetsAt === undefined ? '' : `↻ ${relative(l.resetsAt, at).replace(/^in /, '')}`))
     const checked = r === null ? 0 : Math.max(0, at - r.fetchedAt)
     const scheduled = w.crons.length + w.jobs.length
     const changes = g === null ? [] : [
@@ -901,8 +1090,11 @@ export const register: Register = (on, options) => {
       g.behind > 0 ? `${g.behind} behind` : '',
     ].filter(Boolean)
     const checksTone = { passing: 'success', failing: 'error', running: 'warning', none: undefined }
+    const prText = g?.pr === undefined ? '' : `PR #${g.pr.number} ${g.pr.state}, ${g.pr.checks === 'none' ? 'no checks' : `checks ${g.pr.checks}`}`
+    const modelText = m === null ? 'Waiting for the first reply' : `${modelName(m.model)}${m.effort === undefined ? '' : `  ${m.effort} effort`}`
     const checksDone = settings.checks.filter(c => held.ticked.includes(c.label)).length
     const isChecked = checksDone === settings.checks.length
+    const checkWidth = settings.checks.reduce((total, c) => total + c.label.length + 5, -3)
     const owed = (f?.items ?? [])
       .map((item, order) => ({ item, order, when: item.due === undefined ? undefined : dueIn(item.due, at) }))
       .sort(
@@ -914,100 +1106,160 @@ export const register: Register = (on, options) => {
     const dueCount = owed.filter(o => o.when?.isDue).length
     const followUpsValue =
       f === null ? 'checking' : f.error !== undefined ? 'unreadable' : dueCount > 0 ? `${dueCount} due` : owed.length === 0 ? 'none' : `${owed.length} open`
+    const sessionChart = past.points.length >= 2 ? chart(past.points, chartWidth, CHART_ROWS, settings.handoffAt, contextScale) : undefined
+    const compactions = past.compactions === 0 ? '' : ` · ${past.compactions} compaction${past.compactions === 1 ? '' : 's'}`
 
     const done = p?.tasks.filter(t => t.status === 'done').length ?? 0
     const firstOpen = Math.max(0, p?.tasks.findIndex(t => t.status !== 'done') ?? 0)
     const planStart = p && p.tasks.length > PLAN_ROWS ? Math.max(0, Math.min(firstOpen - 1, p.tasks.length - PLAN_ROWS)) : 0
     const planRows = p?.tasks.slice(planStart, planStart + PLAN_ROWS) ?? []
     const planRest = (p?.tasks.length ?? 0) - planStart - planRows.length
+    const typeWidth = Math.max(0, ...a.map(agent => agent.type.length))
+    const runsOnWidth = Math.max(0, ...a.map(agent => (agent.model === undefined ? 0 : runsOn(agent.model, agent.effort).length)))
 
     return (
       <Box flexDirection="column">
-        {m === null ? (
-          <Text dimColor>Waiting for the first reply</Text>
-        ) : (
-          <Text>
-            <Text weight="bold">{modelName(m.model)}</Text>
-            {m.effort !== undefined && <Text dimColor>  {m.effort} effort</Text>}
-          </Text>
+        <Box justifyContent="space-between">
+          {m === null ? (
+            <Text dimColor>Waiting for the first reply</Text>
+          ) : (
+            <Text>
+              <Text weight="bold">{modelName(m.model)}</Text>
+              {m.effort !== undefined && <Text dimColor>  {m.effort} effort</Text>}
+            </Text>
+          )}
+          {g !== null && <Text weight="bold">{fit(g.branch, Math.max(8, cols - modelText.length - 2))}</Text>}
+        </Box>
+        {g !== null && (
+          <Box justifyContent="space-between">
+            <Text dimColor>{fit(changes.length === 0 ? 'clean' : changes.join(' · '), Math.max(8, cols - prText.length - 1))}</Text>
+            {g.pr !== undefined && (
+              <Text color={checksTone[g.pr.checks]} dimColor={g.pr.checks === 'none'}>
+                {fit(prText, Math.max(8, cols - 9))}
+              </Text>
+            )}
+          </Box>
+        )}
+
+        <Box marginTop={1} flexDirection="column">
+          {u?.percent === undefined ? (
+            <Box justifyContent="space-between">
+              <Text weight="bold">Context</Text>
+              <Text dimColor>no reading</Text>
+            </Box>
+          ) : (
+            <Box flexDirection="column">
+              {meter('Context', u.percent, contextScale, { tick: settings.handoffAt })}
+              {caption(u.tokens === undefined ? '' : `${tokens(u.tokens)} of ${tokens(u.window)} tokens`, `handoff at ${settings.handoffAt}%`)}
+            </Box>
+          )}
+          {fl.parts.length > 0 && caption(listed(fl.parts, captionWidth))}
+          {fl.results.length > 0 && caption(listed(fl.results, captionWidth, 'largest results: '))}
+        </Box>
+
+        {limits.length > 0 && (
+          <Box marginTop={1} flexDirection="column">
+            {limits.map((l, i) => {
+              const ahead = forecast(l, at)
+              const reset = resets[i] ?? ''
+              const note = ahead === undefined ? '' : `out in ~${span(ahead.outIn)}, ${span(ahead.early)} before reset`
+
+              return (
+                <Box flexDirection="column">
+                  {meter(label(l.kind), l.percentUsed, limitScale, { trail: ahead !== undefined })}
+                  {(note !== '' || reset !== '') &&
+                    caption(fit(note, Math.max(8, captionWidth - reset.length - 1)), reset, note === '' ? undefined : 'warning')}
+                </Box>
+              )
+            })}
+          </Box>
+        )}
+
+        {sessionChart !== undefined && section('This session', `${past.turns} replies${compactions}`)}
+        {sessionChart !== undefined && (
+          <Box flexDirection="column">
+            {sessionChart.lines.map((runs, row) => (
+              <Text>
+                {drawn(runs)}
+                {row === sessionChart.handoffRow && <Text dimColor> {settings.handoffAt}%</Text>}
+              </Text>
+            ))}
+            <Text dimColor>{`start${' '.repeat(Math.max(1, chartWidth - 8))}now`}</Text>
+          </Box>
         )}
 
         {settings.checks.length > 0 &&
           section('Checklist', isChecked ? 'all done' : `${checksDone} of ${settings.checks.length} done`, isChecked ? 'success' : 'warning')}
+        {!isChecked && checkWidth <= cols && (
+          <Text>
+            {settings.checks.map((c, i) => {
+              const isTicked = held.ticked.includes(c.label)
+
+              return (
+                <Text dimColor={isTicked}>
+                  {i > 0 ? '   ' : ''}
+                  <Text color={isTicked ? 'success' : undefined}>{isTicked ? '✓' : '·'}</Text> {c.label}
+                </Text>
+              )
+            })}
+          </Text>
+        )}
         {!isChecked &&
+          checkWidth > cols &&
           settings.checks.map(c => {
             const isTicked = held.ticked.includes(c.label)
 
             return (
               <Text dimColor={isTicked}>
-                <Text color={isTicked ? 'success' : undefined}>{isTicked ? '✓' : '·'}</Text> {c.label}
+                <Text color={isTicked ? 'success' : undefined}>{isTicked ? '✓' : '·'}</Text> {fit(c.label, cols - 2)}
               </Text>
             )
           })}
-
-        {section('Context', u?.percent === undefined ? 'no reading' : `${u.percent}%`, contextTone)}
-        {u?.percent !== undefined && contextTone !== undefined && (
-          <Box flexDirection="column">
-            <Text>{drawn(gauge(cols, u.percent, contextTone, { tick: settings.handoffAt }))}</Text>
-            <Box justifyContent="space-between">
-              <Text dimColor>{u.tokens === undefined ? '' : `${tokens(u.tokens)} of ${tokens(u.window)} tokens`}</Text>
-              <Text dimColor>handoff at {settings.handoffAt}%</Text>
-            </Box>
-          </Box>
-        )}
-        {fl.parts.length > 0 && <Text dimColor>{fit(listed(fl.parts), cols)}</Text>}
-        {fl.results.length > 0 && <Text dimColor>{fit(`largest results: ${listed(fl.results)}`, cols)}</Text>}
-
-        {section(
-          'Limits',
-          worst === undefined ? 'no reading' : `${label(worst.kind)} ${Math.round(worst.percentUsed)}%`,
-          worst === undefined ? undefined : tone(worst.percentUsed, LIMIT_WARN_AT, LIMIT_ALARM_AT),
-        )}
-        {(u?.limits ?? []).map((l, i) => {
-          const ahead = pace(l, at)
-          const reset = resets[i] ?? ''
-          const width = Math.max(6, cols - resetWidth - 12)
-
-          return (
-            <Box flexDirection="column">
-              <Box justifyContent="space-between">
-                <Text>
-                  {label(l.kind).padEnd(3)} {drawn(gauge(width, l.percentUsed, tone(l.percentUsed, LIMIT_WARN_AT, LIMIT_ALARM_AT), { trail: ahead !== undefined }))}{' '}
-                  {String(Math.round(l.percentUsed)).padStart(3)}%
-                </Text>
-                {reset !== '' && <Text dimColor>{reset.padStart(resetWidth)}</Text>}
-              </Box>
-              {ahead !== undefined && <Text color="warning">    {ahead}</Text>}
-            </Box>
-          )
-        })}
-
-        {g !== null && section('Repo', g.branch)}
-        {g !== null && <Text dimColor>{changes.length === 0 ? 'clean' : changes.join(', ')}</Text>}
-        {g?.pr !== undefined && (
-          <Text color={checksTone[g.pr.checks]} dimColor={g.pr.checks === 'none'}>
-            {fit(`PR #${g.pr.number} ${g.pr.state}, ${g.pr.checks === 'none' ? 'no checks' : `checks ${g.pr.checks}`}`, cols)}
-          </Text>
-        )}
 
         {section('Plan', p === null ? 'none' : `${done} of ${p.tasks.length} done`)}
         {p === null ? (
           <Text dimColor>Reading a docs/superpowers/plans file starts it</Text>
         ) : (
           <Box flexDirection="column">
-            <Text>{fit(p.title, cols)}</Text>
+            <Text weight="bold">{fit(p.title, cols)}</Text>
             {planStart > 0 && <Text dimColor>  … {planStart} done above</Text>}
             {planRows.map(t => (
               <Text dimColor={t.status !== 'doing'}>
                 <Text color={t.status === 'done' ? 'success' : t.status === 'doing' ? ACCENT : undefined}>
                   {t.status === 'done' ? '✓' : t.status === 'doing' ? '▸' : '·'}
                 </Text>{' '}
-                {fit(`${t.n} ${t.title}`, cols - 2)}
+                <Text weight={t.status === 'doing' ? 'bold' : undefined}>{fit(`${t.n} ${t.title}`, cols - 2)}</Text>
               </Text>
             ))}
             {planRest > 0 && <Text dimColor>  … {planRest} more</Text>}
           </Box>
         )}
+
+        {section('Agents', a.length === 0 ? 'none' : agentCounts(a))}
+        {a.map(agent => {
+          const model = agent.model === undefined ? '' : runsOn(agent.model, agent.effort)
+          const when = agent.isRunning ? '' : `${span(Math.max(0, at - (agent.finishedAt ?? at)))} ago`
+          const room = Math.max(8, cols - typeWidth - runsOnWidth - when.length - 7)
+          const isCostly = COSTLY_MODEL.test(agent.model ?? '')
+
+          return (
+            <Box flexDirection="column">
+              <Box justifyContent="space-between">
+                <Text>
+                  <Text color={agent.isRunning ? ACCENT : 'success'}>{agent.isRunning ? '▸' : '✓'}</Text>{' '}
+                  <Text weight="bold">{agent.type.padEnd(typeWidth)}</Text>{'  '}
+                  <Text color={isCostly ? 'warning' : undefined} dimColor={!isCostly}>
+                    {model.padEnd(runsOnWidth)}
+                  </Text>
+                  {'  '}
+                  <Text dimColor={!agent.isRunning}>{fit(agent.description, room)}</Text>
+                </Text>
+                {when !== '' && <Text dimColor>{when}</Text>}
+              </Box>
+              {agent.isRunning && agent.doing !== undefined && <Text dimColor>  ↳ {fit(agent.doing, cols - 4)}</Text>}
+            </Box>
+          )
+        })}
 
         {settings.followUps !== undefined &&
           section('Follow-ups', followUpsValue, dueCount > 0 ? 'warning' : f?.error !== undefined ? 'error' : undefined)}
@@ -1029,34 +1281,6 @@ export const register: Register = (on, options) => {
         {settings.followUps !== undefined && owed.length > FOLLOW_UP_ROWS && (
           <Text dimColor>  … {owed.length - FOLLOW_UP_ROWS} more</Text>
         )}
-
-        {section('Agents', a.length === 0 ? 'none' : agentCounts(a))}
-        {a.map(agent => {
-          const model = agent.model === undefined ? undefined : runsOn(agent.model, agent.effort)
-          const when = agent.isRunning ? '' : `${span(Math.max(0, at - (agent.finishedAt ?? at)))} ago`
-          const room = Math.max(8, cols - agent.type.length - (model?.length ?? 0) - when.length - 7)
-          const isCostly = COSTLY_MODEL.test(agent.model ?? '')
-
-          return (
-            <Box flexDirection="column">
-              <Box justifyContent="space-between">
-                <Text>
-                  <Text color={agent.isRunning ? ACCENT : 'success'}>{agent.isRunning ? '▸' : '✓'}</Text>{' '}
-                  <Text weight="bold">{agent.type}</Text>{'  '}
-                  {model !== undefined && (
-                    <Text color={isCostly ? 'warning' : undefined} dimColor={!isCostly}>
-                      {model}
-                    </Text>
-                  )}
-                  {'  '}
-                  {fit(agent.description, room)}
-                </Text>
-                {when !== '' && <Text dimColor>{when}</Text>}
-              </Box>
-              {agent.isRunning && agent.doing !== undefined && <Text dimColor>  ↳ {fit(agent.doing, cols - 4)}</Text>}
-            </Box>
-          )
-        })}
 
         {section('Scheduled', scheduled === 0 ? 'none' : String(scheduled))}
         {w.crons.map(c => (
