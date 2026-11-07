@@ -47,6 +47,8 @@ const CHART_ROWS = 6
 const CHART_LABEL_WIDTH = 5
 const HISTORY_KEPT = 240
 const CLIFF = 10
+const FORECAST_SPAN = 8
+const MIN_RATE = 0.2
 
 const PLAN_TOOL_DESCRIPTION =
   "Marks a task of the implementation plan in the person's session deck pane as todo, doing or done. " +
@@ -656,13 +658,47 @@ function columns(points: readonly number[], width: number): number[] {
   })
 }
 
+type Ahead = { points: number; replies: number; rate: number }
+
+/**
+ * @return [Ahead, undefined] how many points and replies until the context reaches `handoffAt`
+ *   at the pace of the last FORECAST_SPAN points since the latest cliff, or undefined when it is
+ *   past the mark, flat or falling, or there are too few points to tell
+ */
+function handoffIn(past: History, handoffAt: number): Ahead | undefined {
+  const { points } = past
+  let start = points.length - 1
+  while (start > 0 && (points[start - 1] ?? 0) - (points[start] ?? 0) <= CLIFF) start -= 1
+
+  const span = points.slice(Math.max(start, points.length - FORECAST_SPAN))
+  const first = span[0]
+  const last = span.at(-1)
+  if (span.length < 3 || first === undefined || last === undefined || last >= handoffAt) return undefined
+
+  const rate = (last - first) / (span.length - 1)
+  if (rate < MIN_RATE) return undefined
+
+  const ahead = (handoffAt - last) / rate
+
+  return { points: ahead, replies: Math.max(1, Math.ceil((ahead * past.turns) / points.length)), rate }
+}
+
+const DOTS = ['⡀', '⠄', '⠂', '⠁']
+
 /**
  * @return [Hash] `lines`, an area chart `rows` tall of `points` (percents) across `width`
  *   columns, each row coloured by the height it stands for, with the handoff mark dashed across
- *   the empty cells of `handoffRow`
+ *   the empty cells of `handoffRow` and, given `ahead`, a dotted line on from the last point to
+ *   the mark in the columns after `drawn`
  */
-function chart(points: readonly number[], width: number, rows: number, handoffAt: number, scale: Scale) {
-  const values = columns(points, width)
+function chart(points: readonly number[], width: number, rows: number, handoffAt: number, scale: Scale, ahead?: Ahead) {
+  const extra = ahead === undefined ? 0 : Math.min(ahead.points, Math.max(2, points.length / 2))
+  const drawn = extra === 0 ? width : Math.max(2, Math.round(((points.length - 1) / (points.length - 1 + extra)) * (width - 1)) + 1)
+  const last = points.at(-1) ?? 0
+  const projected = Array.from({ length: width - drawn }, (_, j) =>
+    Math.min(handoffAt, last + (ahead?.rate ?? 0) * (((j + 1) / (width - drawn)) * extra)),
+  )
+  const values = columns(points, drawn)
   const top = Math.min(100, Math.max(handoffAt + 10, ...values.map(v => v + 10)))
   const handoffRow = Math.min(rows - 1, Math.max(0, rows - Math.ceil((handoffAt / top) * rows)))
 
@@ -670,33 +706,76 @@ function chart(points: readonly number[], width: number, rows: number, handoffAt
     const high = ((rows - r) / rows) * top
     const low = ((rows - r - 1) / rows) * top
     const color = heat((low + high) / 2, scale)
-    const isHandoffRow = r === handoffRow
+    const empty = (c: number): Run =>
+      r === handoffRow ? { glyph: c % 2 === 0 ? '╌' : ' ', color: HANDOFF_LINE } : { glyph: ' ', color: TRACK }
 
-    return merged(
-      values.map((v, c): Run => {
+    return merged([
+      ...values.map((v, c): Run => {
         if (v >= high) return { glyph: '█', color }
         if (v > low) return { glyph: RISING[Math.max(0, Math.round(((v - low) / (high - low)) * 8) - 1)] ?? '▁', color }
 
-        return isHandoffRow ? { glyph: c % 2 === 0 ? '╌' : ' ', color: HANDOFF_LINE } : { glyph: ' ', color: TRACK }
+        return empty(c)
       }),
-    )
+      ...projected.map((v, j): Run =>
+        v > low && v <= high
+          ? { glyph: DOTS[Math.min(3, Math.floor(((v - low) / (high - low)) * 4))] ?? '⠂', color: heat(v, scale) }
+          : empty(drawn + j),
+      ),
+    ])
   })
 
-  return { lines, handoffRow }
+  return { lines, handoffRow, drawn }
 }
 
 /**
- * @return [History] `last` with a reply's context percent added, halved by pairs (keeping the
- *   higher of each) once it holds more than HISTORY_KEPT
+ * @return [Number] the chart column that point `point` of `count` falls in, across `drawn` columns
  */
-function withPoint(last: History, percent: number): History {
-  const points = [...last.points, percent]
-  const kept =
-    points.length > HISTORY_KEPT
-      ? Array.from({ length: Math.ceil(points.length / 2) }, (_, i) => Math.max(points[2 * i] ?? 0, points[2 * i + 1] ?? 0))
-      : points
+function columnOf(point: number, count: number, drawn: number): number {
+  if (count >= drawn) return Math.min(drawn - 1, Math.floor((point * drawn) / count))
 
-  return { ...last, points: kept, turns: last.turns + 1 }
+  return count <= 1 ? 0 : Math.round((point / (count - 1)) * (drawn - 1))
+}
+
+/**
+ * @return [String] the chart's axis `width` wide: `start` under its first column, `now` ending
+ *   under its last real one (column `drawn - 1`), and a `▲` under `jumpAt` where it clears both
+ */
+function axisOf(width: number, drawn: number, jumpAt?: number): string {
+  const cells = Array.from({ length: width }, () => ' ')
+  const nowAt = Math.max(6, drawn - 3)
+  'start'.split('').forEach((glyph, i) => (cells[i] = glyph))
+  'now'.split('').forEach((glyph, i) => (cells[nowAt + i] = glyph))
+  if (jumpAt !== undefined && jumpAt > 5 && (jumpAt < nowAt - 1 || jumpAt > nowAt + 3)) cells[jumpAt] = '▲'
+
+  return cells.join('').trimEnd()
+}
+
+/**
+ * @return [History] `last` with a reply's context percent added (and, with `used`, its rise in
+ *   tokens, kept as the jump when it is the session's largest, with the turn's largest tool
+ *   result as its likely cause), halved by pairs (keeping the higher of each) once it holds
+ *   more than HISTORY_KEPT
+ */
+function withPoint(last: History, percent: number, used?: number): History {
+  const points = [...last.points, percent]
+  const rise = used === undefined || last.lastTokens === undefined ? 0 : used - last.lastTokens
+  const jump =
+    rise > (last.jump?.rise ?? 0)
+      ? { point: points.length - 1, rise, ...(last.turnTop === undefined ? {} : { cause: last.turnTop }) }
+      : last.jump
+  const isHalved = points.length > HISTORY_KEPT
+  const kept = isHalved
+    ? Array.from({ length: Math.ceil(points.length / 2) }, (_, i) => Math.max(points[2 * i] ?? 0, points[2 * i + 1] ?? 0))
+    : points
+  const { turnTop: _turnTop, jump: _jump, lastTokens: _lastTokens, ...rest } = last
+
+  return {
+    ...rest,
+    points: kept,
+    turns: last.turns + 1,
+    ...(used === undefined ? {} : { lastTokens: used }),
+    ...(jump === undefined ? {} : { jump: isHalved ? { ...jump, point: Math.floor(jump.point / 2) } : jump }),
+  }
 }
 
 function tokens(n: number): string {
@@ -934,6 +1013,9 @@ export const register: Register = (on, options) => {
         ...last,
         results: [...last.results, result].sort((x, y) => y.tokens - x.tokens).slice(0, FILL_PARTS),
       })).catch(() => undefined)
+      await update($, history, last => ((last.turnTop?.tokens ?? 0) >= size ? last : { ...last, turnTop: result })).catch(
+        () => undefined,
+      )
     }
 
     const met = settings.checks.filter(c => meets(c, e.tool, e as Record<string, unknown>)).map(c => c.label)
@@ -948,8 +1030,9 @@ export const register: Register = (on, options) => {
   }).catch(($, e, next) => next(e))
 
   on('classic.Stop', async ($, e, next) => {
-    const percent = (await read($, usage))?.percent
-    if (percent !== undefined) await update($, history, last => withPoint(last, percent))
+    const now = await read($, usage)
+    const percent = now?.percent
+    if (percent !== undefined) await update($, history, last => withPoint(last, percent, now?.tokens))
     await refreshFollowUps($, settings.followUps).catch(() => undefined)
     laterRefreshRepo($)
     await update($, wakeups, () => ({
@@ -1106,8 +1189,25 @@ export const register: Register = (on, options) => {
     const dueCount = owed.filter(o => o.when?.isDue).length
     const followUpsValue =
       f === null ? 'checking' : f.error !== undefined ? 'unreadable' : dueCount > 0 ? `${dueCount} due` : owed.length === 0 ? 'none' : `${owed.length} open`
-    const sessionChart = past.points.length >= 2 ? chart(past.points, chartWidth, CHART_ROWS, settings.handoffAt, contextScale) : undefined
+    const ahead = handoffIn(past, settings.handoffAt)
+    const sessionChart =
+      past.points.length >= 2 ? chart(past.points, chartWidth, CHART_ROWS, settings.handoffAt, contextScale, ahead) : undefined
     const compactions = past.compactions === 0 ? '' : ` · ${past.compactions} compaction${past.compactions === 1 ? '' : 's'}`
+    const jumpAt =
+      sessionChart === undefined || past.jump === undefined
+        ? undefined
+        : columnOf(past.jump.point, past.points.length, sessionChart.drawn)
+    const axis = sessionChart === undefined ? '' : axisOf(chartWidth, sessionChart.drawn, jumpAt)
+    const forecastText =
+      ahead !== undefined
+        ? `handoff in ~${ahead.replies} ${ahead.replies === 1 ? 'reply' : 'replies'}`
+        : (past.points.at(-1) ?? 0) >= settings.handoffAt
+          ? 'past the handoff mark'
+          : ''
+    const jumpText =
+      past.jump === undefined
+        ? ''
+        : `▲ +${tokens(past.jump.rise)}${past.jump.cause === undefined ? ' in one reply' : ` · ${past.jump.cause.name} ${tokens(past.jump.cause.tokens)}`}`
 
     const done = p?.tasks.filter(t => t.status === 'done').length ?? 0
     const firstOpen = Math.max(0, p?.tasks.findIndex(t => t.status !== 'done') ?? 0)
@@ -1184,7 +1284,17 @@ export const register: Register = (on, options) => {
                 {row === sessionChart.handoffRow && <Text dimColor> {settings.handoffAt}%</Text>}
               </Text>
             ))}
-            <Text dimColor>{`start${' '.repeat(Math.max(1, chartWidth - 8))}now`}</Text>
+            <Text dimColor>
+              {axis.split('▲')[0]}
+              {jumpAt !== undefined && axis.includes('▲') && <Text color="warning">▲</Text>}
+              {axis.split('▲')[1] ?? ''}
+            </Text>
+            {(jumpText !== '' || forecastText !== '') && (
+              <Box justifyContent="space-between">
+                <Text dimColor>{fit(jumpText, Math.max(8, cols - forecastText.length - 2))}</Text>
+                {forecastText !== '' && <Text color="warning">{forecastText}</Text>}
+              </Box>
+            )}
           </Box>
         )}
 
