@@ -65,6 +65,8 @@ export type Repo = {
   prCheckedAt?: number
 }
 
+export type History = { points: number[]; turns: number; compactions: number }
+
 declare module 'claude-code' {
   interface PluginState {
     'session-deck': {
@@ -79,6 +81,7 @@ declare module 'claude-code' {
       followUps: Shaped<FollowUps | null>
       fill: Shaped<Fill>
       repo: Shaped<Repo | null>
+      history: Shaped<History>
       now: number
     }
   }
