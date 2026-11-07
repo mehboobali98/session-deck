@@ -703,11 +703,43 @@ test('replies draw the context across the session, with the handoff line and com
     const ui = await $.ui.mount({ ...PANE, surface })
     expect(await ui.find({ type: 'Text', text: '4 replies · 1 compaction' })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: /╌ ╌.*50%$/ })).toBeDefined()
-    expect(await ui.find({ type: 'Text', text: /^start +now$/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /^start +▲ +now$/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: '▲ +250k in one reply' })).toBeDefined()
     const columns = await ui.findAll({ type: 'Text', text: /^[▁▂▃▄▅▆▇█]+$/ })
     expect(columns.some(column => String(column.props.color).startsWith('#'))).toBe(true)
     await ui.unmount()
   }
+})
+
+test('a steady climb is carried on to the handoff mark as a dotted line, with how many replies are left', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  mock.store(on)
+  quietMeasure(on)
+
+  for (const percent of [10, 14, 18, 22, 26, 30]) await reply($, percent)
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: 'handoff in ~5 replies' })).toBeDefined()
+  expect((await ui.findAll({ type: 'Text', text: /[⡀⠄⠂⠁]/ })).length).toBeGreaterThan(0)
+  await ui.unmount()
+})
+
+test('the biggest jump names the largest tool result of its reply', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  mock.store(on)
+  quietMeasure(on)
+  on('tool.call', (_, e) => ({ result: {}, text: 'x'.repeat(e.tool === 'Read' ? 280_000 : 8_000) }))
+
+  await reply($, 10)
+  await $.tool.call({ tool: 'Bash', command: 'git log', description: 'Show history' })
+  await reply($, 12)
+  await $.tool.call({ tool: 'Read', file_path: '/work/docs/big-spec.md' })
+  await reply($, 20)
+  await reply($, 21)
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: '▲ +80k · Read big-spec.md 70k' })).toBeDefined()
+  await ui.unmount()
 })
 
 test('one reply draws no chart yet, and /clear starts it over', async ($, on) => {

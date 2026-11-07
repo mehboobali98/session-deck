@@ -65,7 +65,16 @@ export type Repo = {
   prCheckedAt?: number
 }
 
-export type History = { points: number[]; turns: number; compactions: number }
+export type Jump = { point: number; rise: number; cause?: Part }
+
+export type History = {
+  points: number[]
+  turns: number
+  compactions: number
+  lastTokens?: number
+  jump?: Jump
+  turnTop?: Part
+}
 
 declare module 'claude-code' {
   interface PluginState {
